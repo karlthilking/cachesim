@@ -1,281 +1,276 @@
 #include <bit>
 #include <span>
 #include <algorithm>
+#include <iterator>
+#include <cassert>
 #include "../include/params.hpp"
 #include "../include/cache.hpp"
 
 namespace cachesim {
-cache_directory::cache_directory(size_t size, size_t block_size, u32 assoc)
-    : entries(size / block_size)
-{
-    auto num_sets = size / (block_size * assoc);
-
-    nr_offbits  = std::popcount(block_size - 1);
-    nr_ixbits   = std::popcount(num_sets - 1);
-    set_mask    = (num_sets - 1) << nr_offbits;
-}
-
-std::pair<u64, u64> cache_directory::decompose(u64 addr) const noexcept
-{
-    auto index  = (addr & set_mask) >> nr_offbits;
-    auto tag    = addr >> (nr_offbits + nr_ixbits);
-
-    return {index, tag};
-}
-
-void cache_directory::putS(u64 addr, u32 cpuid)
-{
-    auto [index, tag] = decompose(addr);
-    auto set = std::span{entries.data() + (index * assoc), assoc};
-    
-    /**
-     * Find the entry for the given address in the directory and clear the
-     * present bit for the calling cpu. If this is the last cpu using this
-     * data block (i.e. entry.bitmap == 0), the directory entry can be
-     * marked invalid.
-     */
-    for (auto &entry : set) {
-        if (entry.tag == tag) {
-            entry.bitmap ^= 1ull << cpuid;
-            if (!entry.bitmap)
-                entry.state = Invalid;
-        }
-    }
-}
-
-void cache_directory::putM(u64 addr, u32 cpuid)
-{
-    auto [index, tag] = decompose(addr);
-    auto set = std::span{entries.data() + (index * assoc), assoc};
-
-    for (auto &entry : set) {
-        if (entry.tag == tag)
-            entry.tag = 0;
-    }
-}
-
-void cache_directory::getS(u64 addr, u32 cpuid)
-{
-    auto [index, tag] = decompose(addr);
-    auto set = std::span{entries.data() + (index * assoc), assoc};
-    
-    bool found = false;
-    for (auto &entry : set) {
-        if (entry.tag != tag)
-            continue;
-        else if (entry.state == Invalid)
-            entry.state == Exclusive;
-        else if (entry.state == Modified)
-            entry.state == Shared;
-        entry.bitmap |= (1ull << cpuid);
-    }
-}
-
-void cache_directory::getM(u64 addr, u32 cpuid)
-{
-}
-
 std::pair<u64, u64> cache::decompose(void *addr) const noexcept
 {
-    auto index  = (reinterpret_cast<u64>(addr) & set_mask) >> nr_offbits;
-    auto tag    = reinterpret_cast<u64>(addr) >> (nr_ixbits + nr_offbits);
+    auto index = (reinterpret_cast<u64>(addr) & set_mask) >> nr_offbits;
+    auto tag = reinterpret_cast<u64>(addr) >> (nr_ixbits + nr_offbits);
 
     return {index, tag};
 }
 
-cache::cache(size_t size, size_t block_size, int assoc) noexcept
+cache::cache(size_t size, size_t block_size, u32 assoc, u8 level) noexcept
     : lines(size / block_size),
-      clock_hands(size / (block_size * assoc))
+      clock_hands(size / (block_size * assoc)),
+      level(level)
 {
     auto num_sets = size / (block_size * assoc);
-
-    nr_offbits  = std::popcount(block_size - 1);
-    nr_ixbits   = std::popcount(num_sets - 1);
-    set_mask    = (num_sets - 1) << nr_offbits;
+    nr_offbits = std::popcount(block_size - 1);
+    nr_ixbits = std::popcount(num_sets - 1);
+    set_mask = (num_sets - 1) << nr_offbits;
 }
 
-void cache::evict(void *addr, cache_state new_state) noexcept
+std::pair<bool, cache_state> cache::find(void *addr) const noexcept
 {
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
-    
-    /**
-     * Fisrt search for an invalid entry to see if it is possible to evict
-     * an invalid entry instead of one that may be referenced soon after
-     */
-    auto it = std::find_if(set.begin(), set.end(),
-                           [](const auto &line) { 
-                                return line.state == Invalid; 
-                           });
-    if (it != set.end()) {
-        it->tag = tag;
-        it->state = new_state;
-        it->u = 1;
-        return;
-    }
-    
-    prof.evictions++;
-    /**
-     * Evict a data block from the set where the desired cache line needs
-     * to be placed
-     */
-    size_t hand = clock_hands[index];
-    for (auto i = hand;; i = (i + 1) % set.size()) {
-        /* Unset use bit */
+
+    auto it = std::ranges::find_if(set, [](const auto &line) {
+        return line.tag == tag;
+    });
+    if (it != end(set))
+        return {true, it->state};
+
+    return {false, Invalid};
+}
+
+size_t cache::evict(void *addr) noexcept
+{
+    auto [index, tag] = decompose(addr);
+    auto set = std::span{lines.data() + (index * assoc), assoc};
+
+    auto it = std::ranges::find_of(set, [](const auto &line) {
+        return line.state == Invalid;
+    });
+    if (it != end(set))
+        return std::distance(begin(lines), it);
+
+    for (auto i = clock_hands[index];; i = (i + 1) % set.size()) {
         if (set[i].u) {
             set[i].u = 0;
             continue;
         }
-        
-        /**
-         * If the victim data block is in the modified state, it must be written
-         * back to lower memory before it is replaced
-         */
-        if (set[i].state == Modified) {
-            prof.write_backs++;
-            /**
-             * Assume next level cache is inclusive and already has this line
-             * marked as Modified so it does not have to transition state
-             */
-        }
 
-        /**
-         * Mark that the cache line that is being evicted in no longer cache
-         * by this cpu if this cache level is one before the LLC
-         */
-        if (level == 2) {
-            cache_directory &dir = system::get_directory();
-            u64 victim_addr = ((set[i].tag << nr_ixbits) | index) >> nr_offbits;
-            dir.remove(victim_addr, 
-        }
-
-        /**
-         * Now that a victim for eviction was found, update the line with the
-         * new tag, state, and set the use bit. Also, remember the clock hand
-         * position for the next eviction cycle.
-         */
-        set[i].tag = tag;
-        set[i].state = new_state;
-        set[i].u = 1;
-        clock_hands[index] = i;
-        break;
+        return (index * assoc) + i;
     }
 }
 
 void cache::update(void *addr, cache_state new_state) noexcept
 {
     auto [index, tag] = decompose(addr);
-    auto set = std::span(lines.data() + (index * assoc), assoc};
-
-    auto it = std::find_if(set.begin(), set.end(),
-                           [](const auto &line) { return line.tag == tag; });
-    /**
-     * If the line is not present (but invalid) in the cache, another line
-     * must be evicted in order to store the updated block which is being
-     * brought into the cache.
-     */
-    if (it == set.end()) {
-        evict(addr, new_state);
-        return;
-    }
-        
-    /**
-     * Otherwise, if the block with the matching tag is present, but invalid,
-     * update its state in the cache
-     */
-    for (auto &line : set) {
-        if (line.tag == tag) {
-            line.state = new_state;
-            line.u = 1;
-            return;
-        }
-    }
-}
-
-bool cache::load(void *addr) noexcept
-{
-    auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
 
-    for (auto &line : set) {
-        if (line.tag != tag || line.state == Invalid)
-            continue;
-        prof.hits++;
-        line.u = 1;
-        /**
-         * Regardless of whether the state is Modified, Exclusive or Shared,
-         * a processor read that generates a hit does not require any bus
-         * transactions or state transitions.
-         */
-        return true;
-    }
-
-    return false;
-}
-
-bool cache::store(void *addr) noexcept
-{
-    auto [index, tag] = decompose(addr);
-    auto set = std::span{lines.data() + (index * assoc), assoc};
-
-    for (auto &line : set) {
-        /* If tag does not match, proceed to search */
-        if (line.tag != tag)
-            continue;
-        else if (line.state == Invalid) {
-            /**
-             * If tag matches but the state of the cache line is marked invalid,
-             * then this is a stale copy and has to be supplied either from
-             * main memory or from a cache-to-cache transfer (whichever has
-             * the most up-to-date copy of the data block).
-             */
-            break;
-        }
-        prof.hits++;
-        line.u = 1;
-        if (line.state == Exclusive)
-            line.state = Modified;
-        else if (line.state == Shared) {
-            /**
-             * Broadcast to all other processors caching a local copy of this
-             * data block to invalidate their copies
-             */
-
-        }
-        /**
-         * If the state was modified, no bus transaction or state transition
-         * is necessary (modified state implies exclusivity). The store can
-         * be treated as a normal write hit.
-         */
-        return true;
-    }
+    auto it = std::ranges::find_if(set, [](const auto &line) {
+        return line.tag == tag;
+    });
     
-    prof.misses++;
-    return false;
+    if (it == end(set)) {
+        auto &line = lines[evict(addr)];
+        stats.evictions++;
+        line.state = new_state;
+        line.tag = tag;
+        line.u = 1;
+    } else {
+        if (it->state == Modified) {
+            assert(new_state != Modified);
+            stats.write_backs++;
+        }
+        it->state = new_state;
+        it->u = 1;
+    }
 }
 
-cpu::cpu(int id) noexcept
-    : id(id), 
-      L1i_cache(l1i_size, l1i_blk_size, l1i_assoc),
-      L1d_cache(l1d_size, l1d_blk_size, l1d_assoc),
-      L2_cache(l2_size, l2_blk_size, l2_assoc)
-{}
-
-void cpu::access(void *addr, bool data, bool write) noexcept
+void cache::set_use(void *addr) noexcept
 {
-    if (data && write) {
+    auto [index, tag] = decompose(addr);
+    auto set = std::span{lines.data() + (index * assoc), assoc};
 
-    } else if (data) {
+    auto it = std::ranges::find_if(set, [](const auto &line) {
+        return line.tag == tag;
+    });
 
+    assert(it != end(set));
+    it->u = 1;
+}
+
+response cpu::recvBusUpgr(void *addr) noexcept
+{
+    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
+        L1d.update(addr, Invalid);
+        L2.update(addr, Invalid);
+        return InvAck;
+    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
+        L2.update(addr, Invalid);
+        return InvAck;
+    }
+
+    return NullAck;
+}
+
+response cpu::recvBusRdX(void *addr) noexcept
+{
+    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
+        L1d.update(addr, Invalid);
+        L2.update(addr, Invalid);
+        if (s == Modified)
+            return Flush;
+        return InvAck;
+    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
+        L2.update(addr, Invalid);
+        if (s == Modified)
+            return Flush;
+        return InvAck;
+    }
+
+    return NullAck;
+}
+
+response cpu::recvBusRd(void *addr) noexcept
+{
+    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
+        if (s == Modified) {
+            L1d.update(addr, Shared);
+            L2.update(addr, Shared);
+            return Flush;
+        } else if (s == Exclusive) {
+            L1d.update(addr, Shared);
+            L2.update(addr, Shared);
+            return ShareAck;
+        }
+        return ShareAck;
+    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
+        if (s == Modified) {
+            L1d.update(addr, Shared);
+            L2.update(addr, Shared);
+            return Flush;
+        } else if (s == Exclusive) {
+            L1d.update(addr, Shared);
+            L2.update(addr, Shared);
+            return ShareAck;
+        }
+        return ShareAck;
+    }
+
+    return NullAck;
+}
+
+response cpu::snoop(void *addr, request brq)
+{
+    switch (brq) {
+    case BusRd:
+        return recvBusRd(addr);
+    case BusRdX:
+        return recvBusRdX(addr);
+    case BusUpgr:
+        return recvBusUpgr(addr);
+    default:
+        assert(0);
+    }
+}
+
+response cpu::bcast(void *addr, request brq) noexcept
+{
+    auto cpus = std::span{system::instance().getcpus().data(), ncpus};
+    reponse r = 0u;
+
+    std::ranges::for_each(cpus, [](const auto &proc) {
+        if (&proc == this)
+            continue;
+        r |= proc.snoop(brq);
+    });
+
+    return r;
+}
+
+void cpu::load_data(void *addr) noexcept
+{
+    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
+        L1d.stats.hits++;
+        L1d.set_use(addr);
+    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
+        L1d.stats.misses++;
+        L2.stats.hits++;
+        L2.set_use(addr);
+        /* Load L2 cached block into L1 */
+        L1d.update(addr, Shared);
     } else {
-        if (L1i.load(addr))
-            return;
-        else if (L2.load(addr)) {
-            /**
-             * Data block was found in the L2 cache, bring it into the L1
-             * instruction cache and marked it as shared
-             */
-            L1i.update(addr, Shared);
+        cache &L3 = system::instance().access_L3();
+        L1d.stats.misses++;
+        L2.stats.misses++;
+        
+        if (auto [found, s] = L3.find(addr); found && s != Invalid) {
+            L3.stats.hits++;
+            L3.set_use(addr);
+            
+            if (s == Exclusive) {
+                auto rsp = bcast(addr, BusRd);
+                assert(rsp & ShareAck);
+            } else if (s == Modified) {
+                auto rsp = bcast(addr, BusRd);
+                assert(rsp & Flush);
+            }
+
+            L2.update(addr, Shared);
+            L1d.update(addr, Shared);
+        } else {
+            L3.stats.misses++;
+            L3.update(addr, Exclusive);
+            L2.update(addr, Exclusive);
+            L1d.update(addr, Exclusive);
+        }
+    }
+}
+
+void cpu::store_data(void *addr) noexcept
+{
+    cache &L3 = system::instance().access_L3();
+
+    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
+        L1d.stats.hits++;
+        
+        if (s == Modified)
+            L1d.set_use(addr);
+        else {
+            L1d.update(addr, Modified);
+            L2.update(addr, Modified);
+            L3.update(addr, Modified);
+            if (s == Shared) {
+                auto rsp = bcast(addr, BusUpgr);
+                assert(rsp == (InvAck | NullAck));
+            }
+        }
+    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
+        L1d.stats.misses++;
+        L2.stats.hits++;
+
+        if (s == Modified) {
+            L1d.update(addr, Modified);
+            L2.set_use(addr);
+        } else {
+            L1d.update(addr, Modified);
+            L2.update(addr, Modified);
+            L3.update(addr, Modified);
+            if (s == Shared) {
+                auto rsp = bcast(addr, BusUpgr);
+                assert(rsp == (InvAck | NullAck));
+            }
+        }
+    } else if (auto [found, s] = L3.find(addr); found && s != Invalid) {
+        L1d.stats.misses++;
+        L2.stats.misses++;
+        L3.stats.hits++;
+
+        if (s == Modified) {
+            auto rsp = bcast(addr, BusRdX);
+            assert(rsp & Flush);
+        } else {
+
         }
     }
 }

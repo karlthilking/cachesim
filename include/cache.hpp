@@ -15,8 +15,15 @@ using u64       = std::uint64_t;
 using size_t    = std::size_t;
 
 namespace cachesim {
-enum request {
-    PrRd, PrWr, BusRd, BusRdX, BusUpgr, Flush, FlushOpt
+enum request : u8{
+    BusRd, BusRdX, BusUpgr
+};
+
+enum response : u8 {
+    InvAck      = 0x1, 
+    NullAck     = 0x2,
+    ShareAck    = 0x4,
+    Flush       = 0x8
 };
 
 enum cache_state : u8 {
@@ -45,92 +52,58 @@ struct cache_line {
     {}
 };
 
-template<size_t N = 64 - ncpus - 2, size_t M = ncpus>
-struct cache_dirent {
-    u64 tag     : N;
-    u64 bitmap  : ncpus;
-    u64 state   : 2;
-
-    constexpr cache_dirent() noexcept
-        : tag(0u), bitmap(0u), state(Invalid)
-    {}
-};
-
-class cache_directory {
-private:
-    std::vector<cache_dirent<>> entries;
-    u64                         set_mask;
-    u32                         assoc;
-    u8                          nr_ixbits;
-    u8                          nr_offbits;
-    
-    std::pair<u64, u64> decompose(u64 addr) const noexcept;
-public:
-    cache_directory(size_t size, size_t block_size, u32 assoc) noexcept;
-
-    void putS(u64 addr, u32 cpuid);
-    void putM(u64 addr, u32 cpuid);
-    void getS(u64 addr, u32 cpuid);
-    void getM(u64 addr, u32 cpuid);
-};
-
+template<typename T>
 class cache {
 private:
     std::vector<cache_line> lines;
-    std::vector<size_t>     clock_hands; // 1 clock hand per set for eviction
-    cache_profile           prof;
+    std::vector<size_t>     clock_hands;
+    cache_profile           stats;
     u64                     set_mask;
     u32                     assoc;
-    u8                      nr_offbits; // num offset bits = log2(block size)
-    u8                      nr_ixbits;  // num index bits = log2(num sets)
+    u8                      level;
+    u8                      n_offbits;
+    u8                      n_ixbits;
 
+    friend class cpu;
     std::pair<u64, u64> decompose(void *addr) const noexcept;
 public:
     cache() = default;
-    cache(size_t size, size_t block_size, unsigned int assoc) noexcept;
-    
-    /**
-     * Evict a line to allow the data block corresponding to the given address to
-     * replace the evicted entry in the cache.
-     */
-    void evict(void *addr, cache_state new_state) noexcept;
+    cache(size_t size, size_t block_size, u32 assoc, u8 level) noexcept;
 
-    /**
-     * Update an invalid cache entry with a new state corresponding to where the
-     * data block was brought in from and type of request for the data block
-     */
+    std::pair<bool, cache_state> find(void *addr) const noexcept;
+    size_t evict(void *addr) noexcept;
     void update(void *addr, cache_state new_state) noexcept;
-    
-    /**
-     * Search cache for an entry corresponding to the given address to service
-     * the processor read request.
-     */
-    bool load(void *addr) noexcept;
-
-    /**
-     * Search cache for an entry corresponding to the given address in order
-     * to service the request to perform a write.
-     */
-    bool store(void *addr) noexcept;
+    void set_use(void *addr) noexcept;
 };
 
 class cpu {
 private:
-    cache   L1i_cache;
-    cache   L1d_cache;
-    cache   L2_cache;
+    cache   L1d;
+    cache   L1i;
+    cache   L2;
     u32     id;
 public:
     cpu(int id) noexcept;
-
-    void access(void *addr, bool data, bool write) noexcept;
+    
+    response recvBusUpgr(void *addr) noexcept;
+    response recvBusRdX(void *addr) noexcept;
+    response recvBusRd(void *addr) noexcept;
+    response snoop(void *addr, request brq) noexcept;
+    
+    void sendBusUpgr(void *addr) noexcept;
+    void sendBusRdX(void *addr) noexcept;
+    void sendBusRd(void *addr) noexcept;
+    void bcast(void *addr, request brq) noexcept;
+    
+    void load_data(void *addr) noexcept;
+    void store_data(void *addr) noexcept;
+    void load_instr(void *addr) noexcept;
 };
 
 class system {
 private:
     std::array<cpu, ncpus>  cpus;
-    cache_directory         dir;
-    cache                   L3_cache;
+    cache                   L3;
 
     system() noexcept;
 public:
@@ -140,10 +113,8 @@ public:
         return sys;
     }
 
-    static cache_directory &get_directory() noexcept
-    {
-        return system::instance().dir;
-    }
+    std::array<cpu, ncpus> &get_cpus() noexcept { return cpus; }
+    cache &access_L3() noexcept { return L3; }
 };
 } // cachesim
 #endif // __CACHE_HPP__
