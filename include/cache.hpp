@@ -2,6 +2,8 @@
 #define __CACHE_HPP__
 #include <vector>
 #include <array>
+#include <cstddef>
+#include <tuple>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -13,9 +15,10 @@ using u32       = std::uint32_t;
 using i64       = std::int64_t;
 using u64       = std::uint64_t;
 using size_t    = std::size_t;
+using ptrdiff_t = std::ptrdiff_t;
 
 namespace cachesim {
-enum request : u8{
+enum request : u8 {
     BusRd, BusRdX, BusUpgr
 };
 
@@ -34,10 +37,13 @@ enum cache_state : u8 {
 };
 
 struct cache_profile {
-    u32 hits;
-    u32 misses;
+    u32 wr_hits;
+    u32 rd_hits;
+    u32 wr_misses;
+    u32 rd_misses;
     u32 evictions;
     u32 write_backs;
+    u32 bus_transactions;
 
     constexpr cache_profile() = default;
 };
@@ -60,20 +66,27 @@ private:
     cache_profile           stats;
     u64                     set_mask;
     u32                     assoc;
-    u8                      level;
     u8                      n_offbits;
     u8                      n_ixbits;
+    bool                    local;
 
     friend class cpu;
     std::pair<u64, u64> decompose(void *addr) const noexcept;
 public:
     cache() = default;
-    cache(size_t size, size_t block_size, u32 assoc, u8 level) noexcept;
+    cache(size_t size, size_t block_size, u32 assoc, bool local) noexcept;
 
-    std::pair<bool, cache_state> find(void *addr) const noexcept;
-    size_t evict(void *addr) noexcept;
-    void update(void *addr, cache_state new_state) noexcept;
-    void set_use(void *addr) noexcept;
+    bool contains(void *addr, bool find_invalid) const noexcept;
+    std::tuple<bool, cache_state, ptrdiff_t> find(void *addr) const noexcept;
+
+    std::tuple<bool, cache_state, ptrdiff_t> load(void *addr) noexcept;
+    std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept;
+    
+    size_t elect(void *addr) noexcept;
+    void evict(size_t index, void *addr, cache_state state) noexcept;
+    
+    void insert(void *addr, cache_state state) noexcept;
+    void update(void *addr, cache_state state) noexcept;
 };
 
 class cpu {
