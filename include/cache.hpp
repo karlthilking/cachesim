@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <tuple>
+#include <utility>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -43,7 +44,6 @@ struct cache_profile {
     u32 rd_misses;
     u32 evictions;
     u32 write_backs;
-    u32 bus_transactions;
 
     constexpr cache_profile() = default;
 };
@@ -58,7 +58,6 @@ struct cache_line {
     {}
 };
 
-template<typename T>
 class cache {
 private:
     std::vector<cache_line> lines;
@@ -69,8 +68,10 @@ private:
     u8                      n_offbits;
     u8                      n_ixbits;
     bool                    local;
-
+    
     friend class cpu;
+    friend class system;
+
     std::pair<u64, u64> decompose(void *addr) const noexcept;
 public:
     cache() = default;
@@ -82,11 +83,14 @@ public:
     std::tuple<bool, cache_state, ptrdiff_t> load(void *addr) noexcept;
     std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept;
     
-    size_t elect(void *addr) noexcept;
-    void evict(size_t index, void *addr, cache_state state) noexcept;
+    ptrdiff_t elect(void *addr) noexcept;
+    std::pair<bool, u64> evict(ptrdiff_t loc, 
+                               void *addr, cache_state state) noexcept;
     
-    void insert(void *addr, cache_state state) noexcept;
-    void update(void *addr, cache_state state) noexcept;
+    std::pair<bool, u64> insert(void *addr, cache_state state) noexcept;
+
+    void update(ptrdiff_t loc, cache_state state, bool use) noexcept;
+    void update(void *addr, cache_state state, bool use) noexcept;
 };
 
 class cpu {
@@ -103,20 +107,42 @@ public:
     response recvBusRd(void *addr) noexcept;
     response snoop(void *addr, request brq) noexcept;
     
-    void sendBusUpgr(void *addr) noexcept;
-    void sendBusRdX(void *addr) noexcept;
-    void sendBusRd(void *addr) noexcept;
-    void bcast(void *addr, request brq) noexcept;
+    response ptp(void *addr, u32 bitmap, request brq) noexcept;
+    response bcast(void *addr, request brq) noexcept;
     
     void load_data(void *addr) noexcept;
     void store_data(void *addr) noexcept;
     void load_instr(void *addr) noexcept;
 };
 
+struct dirent {
+    u32 bitmap  : ncpus;
+    u32 dirty   : 1;
+    u32 valid   : 1;
+
+    constexpr dirent() noexcept
+        : bitmap(0u), dirty(0u), valid(0u)
+    {}
+};
+
+struct directory {
+    std::vector<dirent> entries;
+    u64                 set_mask;
+    u32                 assoc;
+    u8                  nr_ixbits;
+    u8                  nr_offbits;
+
+    dirent &find(u64 addr) noexcept;
+    directory() noexcept;
+};
+
 class system {
 private:
     std::array<cpu, ncpus>  cpus;
     cache                   L3;
+    directory               dir;
+    std::mutex              bus;
+    u32                     bus_transactions;
 
     system() noexcept;
 public:
@@ -125,9 +151,32 @@ public:
         system sys;
         return sys;
     }
+    
+    std::array<cpu, ncpus> &access_cpus() noexcept
+    {
+        return cpus;
+    }
 
-    std::array<cpu, ncpus> &get_cpus() noexcept { return cpus; }
-    cache &access_L3() noexcept { return L3; }
+    cache &access_L3() noexcept 
+    {
+        return L3; 
+    }
+    
+    directory &access_dir() noexcept
+    {
+        return dir;
+    }
+
+    void acquire_bus() noexcept
+    {
+        bus.lock();
+        bus_transactions++;
+    }
+
+    void release_bus() noexcept
+    {
+        bus.unlock();
+    }
 };
 } // cachesim
 #endif // __CACHE_HPP__

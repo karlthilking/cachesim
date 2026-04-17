@@ -96,14 +96,31 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::find(void *addr) const noexcept
  *  If the data block is not found at all, increment the number of read
  *  misses.
  *
+ *  Private cache (L1-L2):
+ *   state = Invalid -> cache miss -> go down hierarchy
+ *   state = Shared -> cache hit -> no bus transaction -> Shared
+ *   state = Exclusive -> cache hit -> no bus transaction -> Exclusive
+ *   state = Modified -> cache hit -> no bus transaction -> Modified
+ *  Shared cache (L3):
+ *   state = Invalid -> cache miss -> fetch from RAM
+ *   state = Shared -> cache hit -> no bus transaction -> Shared
+ *   state = Exclusive -> cache hit -> send BusRd -> Shared
+ *   state = Modified -> cache miss -> send BusRd -> Flush -> Shared
+ *
  * @addr: The memory address corresponding to the load
  */
 std::tuple<bool, cache_state, ptrdiff_t> cache::load(void *addr) noexcept
 {
-    if (auto [found, state, loc] = find(addr); found && state != Invalid) {
+    if (auto [found, state, loc] = find(addr); found) {
+        if (state == Invalid) {
+            stats.rd_misses++;
+            return {false, Invalid, loc};
+        }
+
         lines[loc].u |= 1;
         if (local || state != Modified)
             stats.rd_hits++;
+
         return {true, state, loc};
     }
     
@@ -128,21 +145,21 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::load(void *addr) noexcept
  *  copy which needs to be written back to main memory or directly transferred
  *  for this processor.
  *
- *  For a private cache:
- *   state = Invalid -> cache miss
+ *  Private cache (L1-L2):
+ *   state = Invalid -> cache miss -> go down hierarchy
  *   state = Shared -> cache hit -> send BusUpgr -> Modified
  *   state = Exclusive -> cache hit -> no bus transaction -> Modified
- *   state = Modified -> cache hit <-> Modified 
+ *   state = Modified -> cache hit -> no bus transaction -> Modified 
  *
- *  For a shared cache:
- *   state = Invalid -> cache miss
+ *  Shared cache (L3):
+ *   state = Invalid -> cache miss -> fetch from RAM
  *   state = Shared -> cache hit -> send BusUpgr -> Modified
  *   state = Exclusive -> cache hit -> send BusUpgr -> Modified
  *   state = Modified -> cache miss -> send BusRdX -> Modified
  *
  * @addr: The memory address corresponding to the store
  */
-std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept
+std::tuple<bool, cache_state, ptrdiff_t> cache::store(void *addr) noexcept
 {
     if (auto [found, state, loc] = find(addr); found && state != Invalid) {
         lines[loc].u |= 1;
@@ -158,11 +175,12 @@ std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept
 /**
  * cache::elect()
  *  Elect a victim block in the set of the given address such that the
- *  victim block can be evicted and replaced if necessary.
+ *  victim block can be evicted and replaced if necessary. The index of
+ *  the candidate for eviction is returned.
  *
  * @addr: Address specifying the set to identify a victim block in
  */
-size_t cache::elect(void *addr) noexcept
+ptrdiff_t cache::elect(void *addr) noexcept
 {
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
@@ -187,25 +205,36 @@ size_t cache::elect(void *addr) noexcept
  * cache::evict()
  *  Commit the eviction of the data block at the given index, replacing it
  *  with the data block corresponding to the provided address whose state
- *  will set to the given state.
+ *  will set to the given state. Returns true along with the address of the
+ *  evicted line if it needed to be written back in order to allow for the
+ *  next level of cache to potentially update the state of the data block.
  *
  * @index: Index to evict/replace in the cache
  * @addr: Address of load/store that necessitated an eviction
  * @state: State to set for the new data block replacing the victim block
  */
-void cache::evict(size_t index, void *addr, cache_state state) noexcept
+std::pair<bool, u64> cache::evict(ptrdiff_t loc, 
+                                  void *addr, cache_state state) noexcept
 {
-    auto [_, tag] = decompose(addr);
+    auto [index, tag] = decompose(addr);
+    std::pair<bool, u64> ret = {false, 0u};
     cache_line &victim = lines[index];
-
-    if (victim.state == Modified)
+    
+    if (victim.state == Modified) {
+        ret = {true, ((tag << nr_ixbits) | index) << nr_offbits};
         stats.write_backs++;
-
+    }
+    
+    /**
+     * Overwrite contents of evicted cache line with the replacement
+     * data block's metadata and set reference bit
+     */
     victim.tag = tag;
     victim.state = state;
     victim.u = 1;
 
     stats.evictions++;
+    return ret;
 }
 
 /**
@@ -215,22 +244,30 @@ void cache::evict(size_t index, void *addr, cache_state state) noexcept
  *  can be replaced by the insterted line. Otherwise, an eviction needs to
  *  occur to insert the new cache line.
  *
+ *  If an eviction is necessary to insert the line, and the eviction causes a
+ *  write back, the return value is {true, victim_address} in case the next
+ *  level of cache is able to change the state of its copy of the data block
+ *  due to the write back.
+ *   For e.g. if a modified block is written back from L2 to L3, then L3
+ *   can change the state of its copy to Shared.
+ *
  *  @addr: Address of the original load/store that requested this data block
  *  @state: The state to set for the newly inserted cache line
  */
-void cache::insert(void *addr, cache_state state) noexcept
+std::pair<bool, u64> cache::insert(void *addr, cache_state state) noexcept
 {
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
-    auto free = elect(addr);
+    auto loc = elect(addr);
 
-    if (lines[free].state != Invalid)
-        evict(free, addr, state);
-    else {
-        lines[free].tag = tag;
-        lines[free].state = state;
-        lines[free].u = 1;
-    }
+    if (lines[loc].state != Invalid)
+        return evict(loc, addr, state);
+    
+    lines[loc].tag = tag;
+    lines[loc].state = state;
+    lines[loc].u = 1;
+    
+    return {false, 0u};
 }
 
 /**
@@ -239,7 +276,7 @@ void cache::insert(void *addr, cache_state state) noexcept
  *  corresponding to the given address is present.
  *
  * @addr: Address corresponding to the data block to update in the cache
- * @state: New stat to set for the data block
+ * @state: New state to set for the data block
  */
 void cache::update(void *addr, cache_state state) noexcept
 {
@@ -261,17 +298,26 @@ void cache::update(void *addr, cache_state state) noexcept
  *  with InvAck. Otherwise if the block is not present, respond with NullAck
  *  to signify that the block is not present in any of this cpu's caches.
  *
+ * A processor snooping a BusUpgr request implies that it either does not
+ * have the block at all, or it has it in the shared state, otherwise, if
+ * it had the block in the exlusive or modified state, the requesting
+ * processor would have sent a BusRdX (no other processor can have the block
+ * if this processor has it in state M or E). Therefore, the state transition
+ * is either S -> I or I -> I (i.e no change).
+ *
  * @addr: Address corresponding to the data block the sending cpu wishes to
  *        acquire write permission for
  */
 response cpu::recvBusUpgr(void *addr) noexcept
 {
-    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
-        L1d.update(addr, Invalid);
+    if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
+        assert(s == Shared);
+        L1d.lines[loc].state = Invalid;
         L2.update(addr, Invalid);
         return InvAck;
-    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
-        L2.update(addr, Invalid);
+    } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
+        assert(s == Shared);
+        L2.lines[loc].state = Invalid;
         return InvAck;
     }
 
@@ -293,16 +339,29 @@ response cpu::recvBusUpgr(void *addr) noexcept
  */
 response cpu::recvBusRdX(void *addr) noexcept
 {
-    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
-        L1d.update(addr, Invalid);
+    if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
+        L1d.lines[loc].state = Invalid;
         L2.update(addr, Invalid);
-        if (s == Modified)
+        /**
+         * If a private copy of the data block that the requesting processor
+         * wishes to acquire read/write access for is in the modified state,
+         * the owning processor (state = M) needs to write back the data
+         * to main memory and signal that the data has been written back.
+         */
+        if (s == Modified) {
+            L1d.stats.write_backs++;
+            L2.stats.write_backs++;
+            system::instance().access_L3().stats.write_backs++;
             return Flush;
+        }
         return InvAck;
-    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
-        L2.update(addr, Invalid);
-        if (s == Modified)
+    } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
+        L2.lines[loc].state = Invalid;
+        if (s == Modified) {
+            L2.stats.write_backs++;
+            system::instance().access_L3().stats.write_backs++;
             return Flush;
+        }
         return InvAck;
     }
 
@@ -323,26 +382,26 @@ response cpu::recvBusRdX(void *addr) noexcept
  */
 response cpu::recvBusRd(void *addr) noexcept
 {
-    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
-        if (s == Modified) {
-            L1d.update(addr, Shared);
+    if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
+        if (s == Modified || s == Exclusive) {
+            L1d.lines[loc].state = Shared;
             L2.update(addr, Shared);
-            return Flush;
-        } else if (s == Exclusive) {
-            L1d.update(addr, Shared);
-            L2.update(addr, Shared);
-            return ShareAck;
+            if (s == Modified) {
+                L1d.stats.write_backs++;
+                L2.stats.write_backs++;
+                system::instance().access_L3().stats.write_backs++;
+                return Flush;
+            }
         }
         return ShareAck;
-    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
-        if (s == Modified) {
-            L1d.update(addr, Shared);
-            L2.update(addr, Shared);
-            return Flush;
-        } else if (s == Exclusive) {
-            L1d.update(addr, Shared);
-            L2.update(addr, Shared);
-            return ShareAck;
+    } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
+        if (s == Modified || s == Exclusive) {
+            L2.lines[loc].state = Shared;
+            if (s == Modified) {
+                L2.write_backs++;
+                system::instance().access_L3().stats.write_backs++;
+                return Flush;
+            }
         }
         return ShareAck;
     }
@@ -368,8 +427,34 @@ response cpu::snoop(void *addr, request brq)
     case BusUpgr:
         return recvBusUpgr(addr);
     default:
-        assert(0);
+        assert(false);
     }
+}
+
+/**
+ * cpu::ptp()
+ *  Send point-to-point messages to processors with a private copy of a
+ *  data block that needs to be invalidated, shared, flushed, etc.
+ *
+ * @addr: Address that the cpu is requesting r/w access for
+ * @bitmap: Bitmap indicating which processors have the block present
+ * @brq: The bus request to be broadcasted to processors with the data block
+ */
+response cpu::ptp(void *addr, u32 bitmap, request brq)
+{
+    response rsp = 0u;
+    system &sys = system::instance();
+    
+    sys.acquire_bus();
+    auto procs = std::span{sys.access_cpus().data(), ncpus};
+
+    for (auto i = 0u; i < ncpus; i++, bitmap >>= 1) {
+        if (i != id && (bitmap & 1))
+            rsp |= procs[i].snoop(brq);
+    }
+
+    sys.release_bus();
+    return rsp;
 }
 
 /**
@@ -378,109 +463,127 @@ response cpu::snoop(void *addr, request brq)
  *  bus. Collect all received acknowledgements to ensure that the correct
  *  state transition has been initiated.
  *
- * @addr: Address that the cpu is requesting a certain permission for over
- *        the bus
+ * @addr: Address that the cpu is requesting r/w permission for
  * @brq: The specific bus request to be broadcasted to all other processors
  */
 response cpu::bcast(void *addr, request brq) noexcept
 {
-    auto cpus = std::span{system::instance().getcpus().data(), ncpus};
-    reponse r = 0u;
+    response rsp = 0u;
 
-    std::ranges::for_each(cpus, [](const auto &proc) {
+    /* Acquire memory bus to initiate transaction */
+    system::instance().acquire_bus();
+    auto procs = std::span{system::instance().access_cpus().data(), ncpus};
+    
+    std::ranges::for_each(procs, [](const auto &proc) {
         if (&proc == this)
             continue;
-        r |= proc.snoop(brq);
+        rsp |= proc.snoop(brq);
     });
 
-    return r;
+    system::instance().release_bus();
+    return rsp;
 }
 
 void cpu::load_data(void *addr) noexcept
 {
-    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
-        L1d.stats.hits++;
-        L1d.set_use(addr);
-    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
-        L1d.stats.misses++;
-        L2.stats.hits++;
-        L2.set_use(addr);
-        /* Load L2 cached block into L1 */
-        L1d.update(addr, Shared);
-    } else {
-        cache &L3 = system::instance().access_L3();
-        L1d.stats.misses++;
-        L2.stats.misses++;
+    ptrdiff_t L1d_loc = -1, L2_loc = -1;
+
+    do {
+        if (auto [found, s, loc] = L1d.load(addr); found) {
+            /* If not invalid, then cache hit from L1d */
+            if (s != Invalid)
+                break;
+            /* 
+             * If tag matches but the state is invalid, remember location 
+             * of the block in order to update with copy from lower memory
+             */
+            L1d_loc = loc;
+        }
         
-        if (auto [found, s] = L3.find(addr); found && s != Invalid) {
-            L3.stats.hits++;
-            L3.set_use(addr);
+        if (auto [found, s, loc] = L2.load(addr); found) {
+            /* Hit in L2, now bring data block into L1d */
+            if (s != Invalid && L1d_loc >= 0) {
+                L1d.update(L1d_loc, s, true);
+                break;
+            } else if (s != Invalid) {
+                L1d.insert(addr, s);
+                break;
+            }
+            L2_loc = loc;
+        }
+
+        if (auto [found, s, loc] = L3.load(addr); found) {
+            cache_state transition = Shared;
+            directory &dir = system::instance().access_dir();
+            dirent &ent = dir.entries[loc];
             
-            if (s == Exclusive) {
-                auto rsp = bcast(addr, BusRd);
-                assert(rsp & ShareAck);
-            } else if (s == Modified) {
-                auto rsp = bcast(addr, BusRd);
-                assert(rsp & Flush);
+            /**
+             * If state is exclusive or modified, a bus request must be sent
+             * either through point-to-point communication or a broadcast
+             * to all processors.
+             *
+             * If state = E, owning processor must transition to state S.
+             * If state = M, owning processor must flush block and transition
+             * to state S.
+             */
+            if (s == Exclusive || s == Modified)
+                ptp(addr, ent.bitmap, BusRd);
+            else if (s == Invalid) {
+                transition = Exclusive;
+                ent.valid = 1;
             }
 
-            L2.update(addr, Shared);
-            L1d.update(addr, Shared);
-        } else {
-            L3.stats.misses++;
-            L3.update(addr, Exclusive);
-            L2.update(addr, Exclusive);
-            L1d.update(addr, Exclusive);
+            if (L2_loc >= 0)
+                L2.update(L2_loc, transition, true);
+            else if (auto [wb, victim] = L2.insert(addr, transition); wb) {
+                auto [expect, _, victim_loc] = L3.find(victim);
+                assert(expect);
+                /**
+                 * If populating L2 with the requested data block caused a
+                 * write back, the data block written back to L3 should be
+                 * marked dirty (w.r.t. main memory). However, this block
+                 * was modified (implies exclusivity), so so other processor
+                 * should have it present.
+                 */
+                dir.entries[victim_loc].dirty |= 1;
+                dir.entries[victim_loc].bitmap ^= (1ull << id);
+                assert(!dir.entries[victim_loc].bitmap);
+
+                /**
+                 * Mark entry that was written back to L3 as shareable as
+                 * no other processor should have the block and it is
+                 * consistent from the view of each processor as L3 is
+                 * shared.
+                 */
+                L3.lines[victim_loc].state = Shared;
+            }
+
+            if (L1d_loc >= 0)
+                L1d.update(L1d_loc, transition, true);
+            else
+                L1d.insert(addr, transition);
+        
+            ent.bitmap |= (1ull << id);
         }
-    }
+    } while (0);
 }
 
 void cpu::store_data(void *addr) noexcept
 {
-    cache &L3 = system::instance().access_L3();
+}
 
-    if (auto [found, s] = L1d.find(addr); found && s != Invalid) {
-        L1d.stats.hits++;
-        
-        if (s == Modified)
-            L1d.set_use(addr);
-        else {
-            L1d.update(addr, Modified);
-            L2.update(addr, Modified);
-            L3.update(addr, Modified);
-            if (s == Shared) {
-                auto rsp = bcast(addr, BusUpgr);
-                assert(rsp == (InvAck | NullAck));
-            }
-        }
-    } else if (auto [found, s] = L2.find(addr); found && s != Invalid) {
-        L1d.stats.misses++;
-        L2.stats.hits++;
+void cpu::load_instr(void *addr) noexcept
+{
+}
 
-        if (s == Modified) {
-            L1d.update(addr, Modified);
-            L2.set_use(addr);
-        } else {
-            L1d.update(addr, Modified);
-            L2.update(addr, Modified);
-            L3.update(addr, Modified);
-            if (s == Shared) {
-                auto rsp = bcast(addr, BusUpgr);
-                assert(rsp == (InvAck | NullAck));
-            }
-        }
-    } else if (auto [found, s] = L3.find(addr); found && s != Invalid) {
-        L1d.stats.misses++;
-        L2.stats.misses++;
-        L3.stats.hits++;
+directory::directory(size_t size, size_t block_size, u32 assoc) noexcept
+    : entries(size / block_size), assoc(assoc)
+{
+    auto num_sets = size / (block_size * assoc);
 
-        if (s == Modified) {
-            auto rsp = bcast(addr, BusRdX);
-            assert(rsp & Flush);
-        } else {
-
-        }
-    }
+    nr_offbits = std::popcount(block_size - 1);
+    nr_ixbits = std::popcount(num_sets - 1);
+    set_mask = (num_sets - 1) << nr_offbits;
 }
 
 } // cachesim
