@@ -3,8 +3,10 @@
 #include <vector>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <tuple>
 #include <utility>
+#include <numeric>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -20,7 +22,7 @@ using ptrdiff_t = std::ptrdiff_t;
 
 namespace cachesim {
 enum request : u8 {
-    BusRd, BusRdX, BusUpgr
+    BusRd, BusRdX, BusUpgr, Inv
 };
 
 enum response : u8 {
@@ -35,6 +37,12 @@ enum cache_state : u8 {
     Exclusive   = 0x1,
     Shared      = 0x2,
     Invalid     = 0x3
+};
+
+enum evict_result : u8 {
+    None            = 0x0,
+    WriteBack       = 0x1,
+    WriteThrough    = 0x2
 };
 
 struct cache_profile {
@@ -84,10 +92,11 @@ public:
     std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept;
     
     ptrdiff_t elect(void *addr) noexcept;
-    std::pair<bool, u64> evict(ptrdiff_t loc, 
-                               void *addr, cache_state state) noexcept;
     
-    std::pair<bool, u64> insert(void *addr, cache_state state) noexcept;
+    std::pair<evict_result, u64> evict(ptrdiff_t loc, void *addr, 
+                                       cache_state state) noexcept;
+    std::tuple<evict_result, u64, ptrdiff_t> insert(void *addr, 
+                                                    cache_state state) noexcept;
 
     void update(ptrdiff_t loc, cache_state state, bool use) noexcept;
     void update(void *addr, cache_state state, bool use) noexcept;
@@ -100,7 +109,7 @@ private:
     cache   L2;
     u32     id;
 public:
-    cpu(int id) noexcept;
+    cpu(u32 id) noexcept;
     
     response recvBusUpgr(void *addr) noexcept;
     response recvBusRdX(void *addr) noexcept;
@@ -144,28 +153,25 @@ private:
     std::mutex              bus;
     u32                     bus_transactions;
 
-    system() noexcept;
+    system() noexcept
+    {
+        std::iota(begin(cpus), end(cpus), 0u);
+    }
+
+    ~system() noexcept
+    {
+        /* Accumulate stats and dump */
+    }
 public:
     static system &instance() noexcept
     {
-        system sys;
+        static system sys;
         return sys;
     }
     
-    std::array<cpu, ncpus> &access_cpus() noexcept
-    {
-        return cpus;
-    }
-
-    cache &access_L3() noexcept 
-    {
-        return L3; 
-    }
-    
-    directory &access_dir() noexcept
-    {
-        return dir;
-    }
+    auto access_cpus() noexcept -> std::array<cpu, ncpus> & { return cpus; }
+    auto access_dir() noexcept -> directory & { return dir; }
+    auto access_L3() noexcept -> cache & { return L3; }
 
     void acquire_bus() noexcept
     {
