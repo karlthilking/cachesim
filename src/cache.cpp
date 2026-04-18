@@ -32,10 +32,10 @@ std::pair<u64, u64> cache::decompose(void *addr) const noexcept
  * @local: True if a shared cache (L3), false if private (L1, L2)
  */
 cache::cache(size_t size, size_t block_size, u32 assoc, bool local) noexcept
-    : lines(size / block_size),
-      clock_hands(size / (block_size * assoc)),
-      assoc(assoc), 
-      local(local)
+    : lines(size / block_size)
+    , clock_hands(size / (block_size * assoc))
+    , assoc(assoc)
+    , local(local)
 {
     auto num_sets = size / (block_size * assoc);
     nr_offbits = std::popcount(block_size - 1);
@@ -356,10 +356,10 @@ void cache::update(void *addr, cache_state state) noexcept
  *  the second level private cache is unified.
  */
 cpu::cpu(u32 id) noexcept
-    : L1d(l1d_size, l1d_blk_size, l1d_assoc, true),
-      L1i(l1i_size, l1i_blk_size, l1i_assoc, true),
-      L2(l2_size, l2_blk_size, l2_assoc, true), 
-      id(id)
+    : L1d(l1d_size, l1d_blk_size, l1d_assoc, true)
+    , L1i(l1i_size, l1i_blk_size, l1i_assoc, true)
+    , L2(l2_size, l2_blk_size, l2_assoc, true)
+    , id(id)
 {}
 
 /**
@@ -760,19 +760,112 @@ void cpu::load_instr(void *addr) noexcept
     } while (0);
 }
 
-directory::directory(size_t size, size_t block_size, u32 assoc) noexcept
-    : entries(size / block_size), assoc(assoc)
-{
-    auto num_sets = size / (block_size * assoc);
-
-    nr_offbits = std::popcount(block_size - 1);
-    nr_ixbits = std::popcount(num_sets - 1);
-    set_mask = (num_sets - 1) << nr_offbits;
-}
+/**
+ * directory::directory()
+ *  Construct directory with number of entries equal to the number
+ *  of blocks that are stored in the L3 cache
+ */
+directory::directory(size_t size, size_t block_size) noexcept
+    : entries(size / block_size)
+{}
 
 system::system() noexcept
+    : L3(l3_size, l3_blk_size, l3_assoc, false)
+    , directory(l3_size, l3_blk_size)
+    , bus_transactions(0u)
 {
-    auto id = 0u;
-    std::generate(begin(cpus), end(cpus), [&]{ return cpu(id++); });
+    std::iota(begin(cpus), end(cpus), 0u);
 }
+
+system::~system() noexcept
+{
+    u64 L1i_totals[4]{};
+    u64 L1d_totals[6]{};
+    u64 L2_totals[6]{};
+
+    for (const auto &proc : cpus) {
+        L1i_totals[0] += proc.L1i.stats.rd_hits;
+        L1i_totals[1] += proc.L1i.stats.rd_misses;
+        L1i_totals[2] += proc.L1i.stats.evictions;
+        L1i_totals[3] += proc.L1i.stats.write_backs;
+
+        L1d_totals[0] += proc.L1d.stats.wr_hits;
+        L1d_totals[1] += proc.L1d.stats.wr_misses;
+        L1d_totals[2] += proc.L1d.stats.rd_hits;
+        L1d.totals[3] += proc.L1d.stats.rd_misses;
+        L1d.totals[4] += proc.L1d.stats.evictions;
+        L1d.totals[5] += proc.L1d.stats.write_backs;
+
+        L2.totals[0] += proc.L2.stats.wr_hits;
+        L2.totals[1] += proc.L2.stats.wr_misses;
+        L2.totals[2] += proc.L2.stats.rd_hits;
+        L2.totals[3] += proc.L2.stats.rd_misses;
+        L2.totals[4] += proc.L2.stats.evictions;
+        L2.totals[5] += proc.L2.stats.write_backs;
+    }
+
+    u64 instructions    = L1i_totals[0] + L1i_totals[1];
+    u64 loads           = L1i_totals[0] + L1i_totals[1] + 
+                          L1d_totals[2] + L1d_totals[3];
+    u64 stores          = L1d_totals[0] + L1d_totals[1];
+    
+    f64 pct_l1i_hits = static_cast<f64>(L1i_totals[0]) /
+                       static_cast<f64>(L1i_totals[0] +
+                                        L1i_totals[1]);
+
+    f64 pct_l1d_hits = static_cast<f64>(L1d_totals[0] +
+                                        L1d_totals[2]) /
+                       static_cast<f64>(L1d_totals[0] +
+                                        L1d_totals[1] +
+                                        L1d_totals[2] +
+                                        L1d_totals[3]);
+
+    f64 pct_l2_hits = static_cast<f64>(L2_totals[0] + 
+                                       L2_totals[2]) /
+                      static_cast<f64>(L2_totals[0] + 
+                                       L2_totals[1] +
+                                       L2_totals[2] + 
+                                       L2_totals[3]); 
+
+    f64 pct_l3_hits = static_cast<f64>(L3.stats.wr_hits + 
+                                       L3.stats.rd_hits) /
+                      static_cast<f64>(L3.stats.wr_hits + 
+                                       L3.stats.rd_hits +
+                                       L3.stats.wr_misses + 
+                                       L3.stats.rd_misses);
+
+    std::cout << "Cache Summary:\n\n"
+              << "INSTRUCTIONS:     " << instructions       << '\n'
+              << "MEMORY ACCESSES:  " << loads + stores     << '\n'
+              << "TOTAL LOADS:      " << loads              << '\n'
+              << "TOTAL STORES:     " << stores             << '\n'
+              << '\n'
+              << "L1 Data Summary:\n"
+              << "L1d WRITE HITS:   " << L1d_totals[0]      << '\n'
+              << "L1d WRITE MISSES: " << L1d_totals[1]      << '\n'
+              << "L1d READ HITS:    " << L1d_totals[2]      << '\n'
+              << "L1d READ MISSES:  " << L1d_totals[3]      << '\n'
+              << "PERCENT L1d HITS: " << pct_l1d_hits       << '\n'
+              << '\n'
+              << "L1 Instruction Summary:\n"
+              << "L1i READ HITS:    " << L1i_totals[0]      << '\n'
+              << "L1i READ MISSES:  " << L1i_totals[1]      << '\n'
+              << "PERCENT L1i HITS: " << pct_l1i_hits       << '\n'
+              << '\n'
+              << "L2 Summary:\n"
+              << "L2 WRITE HITS:    " << L2_totals[0]       << '\n'
+              << "L2 WRITE MISSES:  " << L2_totals[1]       << '\n'
+              << "L2 READ HITS:     " << L2_totals[2]       << '\n'
+              << "L2 READ MISSES:   " << L2_totals[3]       << '\n'
+              << "PERCENT L2 HITS:  " << pct_l2_hits        << '\n'
+              << '\n'
+              << "L3 Summary:\n"
+              << "L3 WRITE HITS:    " << L3.stats.wr_hits   << '\n'
+              << "L3 WRITE MISSES:  " << L3.stats.wr_misses << '\n'
+              << "L3 READ HITS:     " << L3.stats.rd_hits   << '\n'
+              << "L3 READ MISSES:   " << L3.stats.rd_misses << '\n'
+              << "PERCENT L3 HITS:  " << pct_l3_hits        << '\n'
+              << '\n';
+}
+
 } // cachesim

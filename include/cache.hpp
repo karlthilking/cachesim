@@ -7,6 +7,7 @@
 #include <tuple>
 #include <utility>
 #include <numeric>
+#include <stdfloat>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -17,6 +18,9 @@ using i32       = std::int32_t;
 using u32       = std::uint32_t;
 using i64       = std::int64_t;
 using u64       = std::uint64_t;
+using f16       = std::float16_t;
+using f32       = std::float32_t;
+using f64       = std::float64_t;
 using size_t    = std::size_t;
 using ptrdiff_t = std::ptrdiff_t;
 
@@ -136,13 +140,7 @@ struct dirent {
 
 struct directory {
     std::vector<dirent> entries;
-    u64                 set_mask;
-    u32                 assoc;
-    u8                  nr_ixbits;
-    u8                  nr_offbits;
-
-    dirent &find(u64 addr) noexcept;
-    directory() noexcept;
+    directory(size_t size, size_t block_size) noexcept;
 };
 
 class system {
@@ -153,15 +151,8 @@ private:
     std::mutex              bus;
     u32                     bus_transactions;
 
-    system() noexcept
-    {
-        std::iota(begin(cpus), end(cpus), 0u);
-    }
-
-    ~system() noexcept
-    {
-        /* Accumulate stats and dump */
-    }
+    system() noexcept;
+    ~system() noexcept;
 public:
     static system &instance() noexcept
     {
