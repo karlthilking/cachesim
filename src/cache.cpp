@@ -386,11 +386,32 @@ void cache::update(void *addr, cache_state state, bool use) noexcept
  *  the second level private cache is unified.
  */
 cpu::cpu(u32 id) noexcept
-    : L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache)
+    : sem(0)
+    , L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache)
     , L1i(l1i_size, l1i_blk_size, l1i_assoc, PrivateCache)
     , L2(l2_size, l2_blk_size, l2_assoc, BoundaryCache)
     , id(id)
-{}
+{
+    worker = std::thread([&]{
+        for (;;) {
+            sem.acquire();
+            header h;
+            {
+                std::scoped_lock lock(mtx);
+                h = std::move(tasks.front());
+                tasks.pop();
+            }
+            if (h.stop)
+                return;
+            else if (h.write && h.data)
+                store_data(h.addr);
+            else if (h.data)
+                load_data(h.addr);
+            else
+                load_instr(h.addr);
+        }
+    });
+}
 
 /**
  * cpu::recvBusUpgr()
@@ -1118,7 +1139,6 @@ void cpu::load_instr(void *addr) noexcept
             insert(L1i, L1i_loc, addr, Shared, true);
         } else {
             /* Bring in from RAM -> L3 -> L2 -> L1 */
-            system::instance().acquire_bus();
             insert(L3, -1, addr, Shared, true);
             system::instance().release_bus();
 
@@ -1142,7 +1162,9 @@ system::system() noexcept
     , dir(l3_size, l3_blk_size)
     , bus_transactions(0u)
 {
-    std::iota(begin(cpus), end(cpus), 0u);
+    cpus.reserve(ncpus);
+    for (auto i = 0u; i < ncpus; i++)
+        cpus.emplace_back(i);
 }
 
 system::~system() noexcept
@@ -1151,7 +1173,9 @@ system::~system() noexcept
     u64 L1d_totals[6]{};
     u64 L2_totals[6]{};
 
-    for (const auto &proc : cpus) {
+    for (auto &proc : cpus) {
+        proc.enqueue(nullptr, false, false, true);
+
         L1i_totals[0] += proc.L1i.stats.rd_hits;
         L1i_totals[1] += proc.L1i.stats.rd_misses;
         L1i_totals[2] += proc.L1i.stats.evictions;
@@ -1262,7 +1286,7 @@ auto system::access_cpu(u32 cpuid) noexcept -> cpu &
  *  Access system's cpus in order to initiate a bus transaction or
  *  send a bus request.
  */
-auto system::access_cpus() noexcept -> std::array<cpu, ncpus> &
+auto system::access_cpus() noexcept -> std::vector<cpu> &
 {
     return cpus;
 }
@@ -1322,13 +1346,8 @@ void system::initiate_transaction() noexcept
 void process(void *addr, bool write, bool data)
 {
     int cpuid = sched_getcpu();
-    cachesim::system &sys = cachesim::system::instance();
-    cachesim::cpu &proc = sys.access_cpu(cpuid);
+    assert(cpuid >= 0 && cpuid < cachesim::ncpus);
 
-    if (write && data)
-        proc.store_data(addr);
-    else if (data)
-        proc.load_data(addr);
-    else
-        proc.load_instr(addr);
+    cachesim::system &sys = cachesim::system::instance();
+    sys.access_cpu(cpuid).enqueue(addr, write, data, false);
 }

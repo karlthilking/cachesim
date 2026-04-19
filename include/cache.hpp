@@ -8,6 +8,9 @@
 #include <utility>
 #include <numeric>
 #include <mutex>
+#include <semaphore>
+#include <queue>
+#include <thread>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -134,17 +137,64 @@ public:
     void update(void *addr, cache_state state, bool use) noexcept;
 };
 
+struct header {
+    void    *addr;
+    bool    write;
+    bool    data;
+    bool    stop;
+    
+    header() noexcept
+        : addr(nullptr)
+        , write(false)
+        , data(false)
+        , stop(false)
+    {}
+
+    header(void *addr, bool wr, bool data, bool stop) noexcept
+        : addr(addr)
+        , write(wr)
+        , data(data)
+        , stop(stop)
+    {}
+
+    header(header &&other) noexcept
+        : addr(std::exchange(other.addr, nullptr))
+        , write(other.write)
+        , data(other.data)
+        , stop(other.stop)
+    {}
+
+    header &operator=(header &&other) noexcept
+    {
+        if (this != &other) {
+            addr = std::exchange(other.addr, nullptr);
+            write = other.write;
+            data = other.data;
+            stop = other.stop;
+        }
+        return *this;
+    }
+};
+
 class cpu {
 private:
-    cache   L1d;
-    cache   L1i;
-    cache   L2;
-    u32     id;
+    std::queue<header>          tasks;
+    std::mutex                  mtx;
+    std::counting_semaphore<>   sem;
+    std::thread                 worker;
+    cache                       L1d;
+    cache                       L1i;
+    cache                       L2;
+    u32                         id;
 
     friend class system;
 public:
-    cpu() = default;
     cpu(u32 id) noexcept;
+    
+    cpu(const cpu &other) = delete;
+    cpu &operator=(const cpu &other) = delete;
+    cpu(cpu &&other) = delete;
+    cpu &operator=(cpu &&other) = delete;
     
     response recvBusUpgr(void *addr) noexcept;
     response recvBusRdX(void *addr) noexcept;
@@ -162,6 +212,14 @@ public:
     void load_data(void *addr) noexcept;
     void store_data(void *addr) noexcept;
     void load_instr(void *addr) noexcept;
+    
+    template<typename... Args>
+    void enqueue(Args &&...args) noexcept
+    {
+        std::scoped_lock(mtx);
+        tasks.emplace(std::forward<Args>(args)...);
+        sem.release();
+    }
 };
 
 struct dirent {
@@ -183,7 +241,7 @@ struct directory {
 
 class system {
 private:
-    std::array<cpu, ncpus>      cpus;
+    std::vector<cpu>            cpus;
     cache                       L3;
     directory                   dir;
     std::mutex                  bus;
@@ -199,7 +257,7 @@ public:
     }
     
     auto access_cpu(u32 cpuid) noexcept -> cpu &;
-    auto access_cpus() noexcept -> std::array<cpu, ncpus> &;
+    auto access_cpus() noexcept -> std::vector<cpu> &;
     
     auto access_dir() noexcept -> directory &;
     auto access_L3() noexcept -> cache &;
