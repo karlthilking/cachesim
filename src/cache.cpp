@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iterator>
 #include <cassert>
+#include <cstring>
 #include "../include/params.hpp"
 #include "../include/cache.hpp"
 
@@ -31,14 +32,14 @@ std::pair<u64, u64> cache::decompose(void *addr) const noexcept
  * @assoc: Associativity of the cache
  * @local: True if a shared cache (L3), false if private (L1, L2)
  */
-cache::cache(size_t size, size_t block_size, u32 assoc, bool local) noexcept
-    : lines(size / block_size)
-    , clock_hands(size / (block_size * assoc))
+cache::cache(size_t sz, size_t blk_sz, u32 assoc, cache_type ty) noexcept
+    : lines(sz / blk_sz)
+    , clock_hands(sz / (blk_sz * assoc))
     , assoc(assoc)
-    , local(local)
+    , type(ty)
 {
-    auto num_sets = size / (block_size * assoc);
-    nr_offbits = std::popcount(block_size - 1);
+    auto num_sets = sz / (blk_sz * assoc);
+    nr_offbits = std::popcount(blk_sz - 1);
     nr_ixbits = std::popcount(num_sets - 1);
     set_mask = (num_sets - 1) << nr_offbits;
 }
@@ -127,7 +128,7 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::load(void *addr) noexcept
          * result of the read request is a miss. State M in L3 indicates
          * that another processor has a dirty copy in a private cache.
          */
-        if (state == Invalid || (state == Modified && !local)) {
+        if (state == Invalid || (state == Modified && type == SharedCache)) {
             stats.rd_missess++;
             return {false, state, loc};
         }
@@ -239,7 +240,7 @@ std::pair<evict_result, u64> cache::evict(ptrdiff_t loc, void *addr,
     auto [index, tag] = decompose(addr);
     cache_line &victim = lines[loc];
     auto ret = std::pair<evict_result, u64>{
-        None, ((tag << nr_ixbits) | index) << nr_offbits
+        Default, ((tag << nr_ixbits) | index) << nr_offbits
     };
     
     if (victim.state == Modified && local) {
@@ -256,6 +257,13 @@ std::pair<evict_result, u64> cache::evict(ptrdiff_t loc, void *addr,
              * can be safely evicted from L3.
              */
             ret.first = WriteThrough;
+            /**
+             * Return early and do not yet evict the block from L3. The
+             * processor with a private copy of this block needs to write
+             * the block through to L3 and then from there it may be
+             * safely evicted from L3 and written back to main memory.
+             */
+            return ret;
         } else if (ent.dirty) {
             /**
              * If the data block being evicted from L3 is dirty w.r.t main
@@ -309,8 +317,8 @@ std::pair<evict_result, u64> cache::evict(ptrdiff_t loc, void *addr,
  *          location where the inserted block was placed. If no block was
  *          evicted false, 0, and the inserted location are returned.
  */
-std::tuple<evict_result, u64, ptrdiff_t> cache::insert(void *addr, 
-                                                       cache_state state) noexcept
+std::tuple<evict_result, u64, ptrdiff_t> 
+cache::insert(void *addr, cache_state state) noexcept
 {
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
@@ -325,7 +333,7 @@ std::tuple<evict_result, u64, ptrdiff_t> cache::insert(void *addr,
     lines[loc].state = state;
     lines[loc].u = 1;
     
-    return {false, 0u, loc};
+    return {NoEvict, 0u, loc};
 }
 
 /**
@@ -356,9 +364,9 @@ void cache::update(void *addr, cache_state state) noexcept
  *  the second level private cache is unified.
  */
 cpu::cpu(u32 id) noexcept
-    : L1d(l1d_size, l1d_blk_size, l1d_assoc, true)
-    , L1i(l1i_size, l1i_blk_size, l1i_assoc, true)
-    , L2(l2_size, l2_blk_size, l2_assoc, true)
+    : L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache)
+    , L1i(l1i_size, l1i_blk_size, l1i_assoc, PrivateCache)
+    , L2(l2_size, l2_blk_size, l2_assoc, BoundaryCache)
     , id(id)
 {}
 
@@ -534,6 +542,108 @@ response cpu::recvBusRd(void *addr) noexcept
 }
 
 /**
+ * cpu::recvBusInv()
+ *  Snoop a request to unconditionally invalidate private copies of the
+ *  data block corresponding to the address associated with the bus request.
+ *
+ * @addr: Address of the data block to evict
+ * return: Invalidation acknowledgement if the block is found and was
+ *         invalidated. Otherwise, if the block is not found, a Null
+ *         acknowledgement is returned. If communication is point-to-point
+ *         using a directory, the response should always be InvAck.
+ */
+response cpu::recvBusInv(void *addr) noexcept
+{
+    if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
+        L1d.lines[loc].state = Invalid;
+        L2.update(addr, Invalid);
+        return InvAck;
+    } else if (auto [found, s, loc] = L1i.find(addr); found && s != Invalid) {
+        L1i.lines[loc].state = Invalid;
+        L2.update(addr, Invalid);
+        return InvAck;
+    } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
+        L2.lines[loc].state = Invalid;
+        return InvAck;
+    }
+
+    return NullAck;
+}
+
+/**
+ * cpu::recvBusFlush()
+ *  Respond to request to flush a data block that is dirty in a private
+ *  cache by writing the data block through to L3 and indicating the
+ *  the owning processor no longer has the block present. Because the
+ *  block is written through to L3, it is now dirty with respect to
+ *  main memory (RAM).
+ *
+ *  @addr: Address associated with the block to be flushed
+ *  return: Respond with Flush if the block is present and subsequently
+ *          flushed. Otherwise, if the block is not present, respond
+ *          with NullAck to indicate that no such copy is present in
+ *          this processor's private cache.
+ */
+response cpu::recvBusFlush(void *addr) noexcept
+{
+    if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
+        /**
+         * If receiving a bus request to flush a data block, it is assumed
+         * that the block is only present for one processor, the processor
+         * who owns the dirty copy.
+         */
+        assert(s == Modified);
+        
+        /* Mark the block as invalid */
+        L1d.lines[loc].state = Invalid;
+        L2.update(addr, Invalid);
+        
+        /* Write through to L3 */
+        L1d.stats.write_backs++;
+        L2.stats.write_backs++;
+
+        auto [expect, L3_state, L3_loc] = L3.find(addr);
+        assert(expect && L3_state == Modified);
+
+        dirent &ent = system::instance().access_dir().entries[L3_loc];
+        assert(ent.valid);
+
+        /**
+         * Mark that the block written back to L3 is dirty and that
+         * the processor that received the Flush request no longer
+         * has the block present. Also mark the block as Shared at L3,
+         * it is no longer dirty in a private cache.
+         */
+        ent.dirty = 1;
+        ent.bitmap ^= (1ull << id);
+        assert(!ent.bitmap);
+        system::instance().access_L3().update(L3_loc, Shared, false);
+
+        return Flush;
+    } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
+        assert(s == Modified);
+
+        L2.lines[loc] = Invalid;
+        L2.stats.wr_backs++;
+
+        auto [expect, L3_state, L3_loc] = L3.find(addr);
+        assert(expect && L3_state == Modified);
+
+        dirent &ent = system::instance().access_dir().entries[L3_loc];
+        assert(ent.valid);
+
+        ent.dirty = 1;
+        ent.bitmap ^= (1ull << id);
+        assert(!ent.bitmap);
+        system::instance().access_L3().update(L3_loc, Shared, false);
+
+        return Flush;
+    }
+
+    return NullAck;
+}
+
+/**
  * cpu::snoop()
  *  Snoop a bus-side request. The request can be either a BusRd, BusRdX, or
  *  BusUpgr request coming from another processor.
@@ -550,6 +660,10 @@ response cpu::snoop(void *addr, request brq)
         return recvBusRdX(addr);
     case BusUpgr:
         return recvBusUpgr(addr);
+    case BusInv:
+        return recvBusInv(addr);
+    case BusFlush:
+        return recvBusFlush(addr);
     default:
         assert(false);
     }
@@ -608,6 +722,127 @@ response cpu::bcast(void *addr, request brq) noexcept
     return rsp;
 }
 
+/**
+ * cpu::insert()
+ *  Insert a new data block into the specified cache, handling the 
+ *  different eviction, write back, or flush events to can occur
+ *  due to bringing in the new block.
+ *
+ *  Insertion assumes that the function is used for bringing a new data
+ *  block into the cache, so the reference bit is set after insertion.
+ *
+ * @c: The cache to insert a new data block into
+ * @addr: The address of the new data block being brought in
+ * @state: The state to set for the new data block
+ */
+void cpu::insert(cache &c, ptrdiff_t loc, 
+                 void *addr, cache_state state) noexcept
+{
+    if (loc >= 0) {
+        c.update(loc, state, true);
+        return;
+    } else if (c.type == PrivateCache) {
+        /**
+         * For a private cache that is not at the coherence boundary,
+         * i.e. L1, a block being evicted can be safely ignored, as
+         * the state of the block is unchanged and the block is still
+         * present in a processor-private cache (L2).
+         */
+        c.insert(addr, state);
+        return;
+    }
+    
+    if (c.type == BoundaryCache) {
+        cache &L3 = system::instance().access_L3();
+        if (auto [res, victim, _] = c.insert(addr, state); res) {
+            auto [expect, _, evictloc] = L3.find(victim);
+            assert(expect && res != WriteThrough);
+
+            dirent &evictent = dir.entries[evictloc];
+            /**
+             * Mark that this processor no longer has a copy of this cache
+             * line is one of its private caches
+             */
+            evictent.bitmap ^= (1ull << id);
+            
+            /**
+             * If written back from L2 to L3, mark that the copy of the
+             * data block now in L3 is dirty; it does not reflect what
+             * is in main memory
+             */
+            if (res == WriteBack)
+                evictent.dirty |= 1;
+
+            cache_line &line = L3.lines[evictloc];
+            assert(line.state != Invalid);
+            /**
+             * If the line evicted from L2 to L3 was modified or exclusive
+             * in this cpu's private caches, then it can be shared
+             */
+            if (line.state == Modified || line.state == Exclusive)
+                line.state = Shared;
+        }
+        auto [expect, s, loc] = L3.find(addr);
+        assert(expect);
+        dirent &ent = system::instance().access_dir().entries[loc];
+        /**
+         * Because the requested data block is coming from L3 into
+         * L2, mark the directory entry for this cache line indicating
+         * that the current processor now has a private copy.
+         */
+        ent.bitmap |= (1ull << id);
+    } else if (c.type == SharedCache) {
+        directory &dir = system::instance().access_dir();
+        auto [res, victim, evictloc] = c.insert(addr, state);
+        dirent &evictent = dir.entries[evictloc];
+        
+        /**
+         * If the blocked evicted from L3 was in state M, then another
+         * processor has the most recent copy of this data block in one
+         * of its private caches. The owner must write the block through
+         * to L3 from where it can then be written back to main memory
+         * and safely evicted. The owner must also invalidate their copy.
+         *
+         * Alternatively, if the block in L3 is up-to-date (no processor
+         * has a more recent copy in a private cache), then the evicted
+         * data block only needs to be invalidated by any processors with
+         * a private copy in order to maintain inclusivity.
+         */
+        if (res == WriteBack) {
+            /**
+             * Send request on bus for processors with a private copy
+             * of the evicted block to invalidate their copies.
+             */
+            assert(ptp(victim, evictent.bitmap, BusInv) == InvAck);
+        } else if (res == WriteThrough) {
+            /**
+             * Send request on bus for the processor with the private
+             * and most recent copy of the data block that should be
+             * evicted. Once the write through to L3 completes, the
+             * block is evicted from L3 and its contents are written
+             * back to main memory.
+             */
+            assert(ptp(victim, evictent.bitmap, BusFlush) == Flush);
+            auto [evict_res, _] = L3.evict(evictloc, addr, state);
+            assert(evict_res == WriteBack);
+        }
+        
+        /**
+         * For a new cache line brought into L3 from RAM, its bitmap
+         * should be zeroed (no processor has a private copy yet),
+         * its valid bit should be set and it is not dirty.
+         */
+        dirent &ent = dir.entries[evictloc];
+        ent.bitmap = 0u;
+        ent.valid = 1u;
+        ent.dirty = 0u;
+    }
+}
+
+/**
+ * cpu::load_data()
+ *
+ */
 void cpu::load_data(void *addr) noexcept
 {
     ptrdiff_t L1d_loc = -1, L2_loc = -1;
@@ -666,12 +901,17 @@ void cpu::load_data(void *addr) noexcept
                 ent.dirty = 0;
                 L3.update(loc, Exclusive, true);
             }
+            ent.bitmap |= (1ull << id);
 
             if (L2_loc >= 0)
                 L2.update(L2_loc, transition, true);
-            else if (auto [res, victim, _] = L2.insert(addr, transition); res) {
+            else if (auto [res, victim, _] = L2.insert(addr, transition);
+                     res >= WriteBack) {
+                assert(res != WriteThrough);
                 auto [expect, _, evictloc] = L3.find(victim);
                 assert(expect);
+
+                dirent &evictent = dir.entries[evictloc];
                 /**
                  * If populating L2 with the requested data block caused a
                  * write back, the data block written back to L3 should be
@@ -679,13 +919,13 @@ void cpu::load_data(void *addr) noexcept
                  * was modified (implies exclusivity), so no other processor
                  * should have it present.
                  */
-                dir.entries[evictloc].dirty |= 1;
-                dir.entries[evictloc].bitmap ^= (1ull << id);
-                assert(!dir.entries[evictloc].bitmap);
+                evictent.dirty |= 1;
+                evictent.bitmap ^= (1ull << id);
+                assert(!evictent.bitmap);
 
                 /**
-                 * Mark entry that was written back to L3 as shareable as
-                 * no other processor should have the block and it is
+                 * Mark entry that was written back to L3 as shareable.
+                 * No other processor should have the block and it is
                  * consistent from the view of each processor as L3 is
                  * shared.
                  */
@@ -696,22 +936,64 @@ void cpu::load_data(void *addr) noexcept
                 L1d.update(L1d_loc, transition, true);
             else
                 L1d.insert(addr, transition);
-            
-            ent.bitmap |= (1ull << id);
         } else /* Not present in L3 */ {
             directory &dir = system::instance().access_dir();
             
             /**
-             * If inserting into L3 causes 
+             * If a data block is evicted from L3 as a result of bringing
+             * in the requested data block into L3, then an cpu with a
+             * private copy of this block needs to invalidate it in order
+             * to maintain inclusivity.
+             *
+             * If the evicted block is in state M, then the owner's private
+             * copy is dirty and needs to be written through to main memory
+             * in addition to being invalidated.
+             *
+             * If the evicted block is not dirty in any private cache, but
+             * dirty in L3 w.r.t. main memory, then the block is written
+             * back to RAM and private copies are invalidated.
              */
-            if (auto [wb, victim] = L3.insert(addr); victim > 0u) {
+            if (auto [res, victim, evictloc] = L3.insert(addr, Exclusive);
+                res != NoEvict) {
+                dirent &evictent = dir.entries[evictloc];
+                
+                if (WriteThrough) {
+                    /**
+                     * If the block evicted from L3 was marked Modified,
+                     * then another processor has the most recent copy
+                     * of the evicted data block in a private cache.
+                     * Therefore, the owning processor needs to write
+                     * the block through to L3, and then it can be written
+                     * back from L3 to main memory in order to maintain
+                     * inclusivity and coherence.
+                     */
+                    assert(ptp(victim, evictent.bitmap, BusFlush) == Flush);
+                    auto [evict_res, _] = L3.evict(evictloc, addr, Exclusive);
+                    assert(evict_res == WriteBack);
 
+                    /**
+                     * Block has been evicted from L3, so its associated
+                     * directory entry can be entirely discareded.
+                     */
+                    memset(&evictent, 0, sizeof(dirent));
+                } else if (WriteBack) {
+                    /**
+                     * Otherwise, if the block evicted from L3 was dirty,
+                     * but no other processor has a more up-to-date copy
+                     * of the data block, it simply needs to be marked
+                     * as not present and invalid. Any processor with
+                     * a private copy of this block should invalidate it.
+                     */
+                    assert(ptp(victim, evictent.bitmap, BusInv) == InvAck);
+                    memset(&evictent, 0, sizeof(dirent));
+                }
             }
 
             if (L2_loc >= 0)
                 L2.update(L2_loc, Exclusive, true);
-            else if (auto [wb, victim] = L2.insert(addr); wb) {
-                auto [expect, _, evictloc] = L3.find(addr);
+            else if (auto [res, victim, _] = L2.insert(addr, Exclusive);
+                     res == WriteBack) {
+                auto [expect, _, evictloc] = L3.find(victim);
                 assert(expect);
                 
                 assert(dir.entries[evictloc].valid);
@@ -729,8 +1011,12 @@ void cpu::load_data(void *addr) noexcept
 
             auto [expect, _, loc] = L3.find(addr);
             assert(expect);
-
             dirent &ent = dir.entries[loc];
+
+            /**
+             * Mark that the requesting processor now has the block
+             * present in its private cache.
+             */
             ent.bitmap |= (1ull << id);
             ent.dirty = 0;
             ent.valid = 1;
@@ -749,13 +1035,124 @@ void cpu::store_data(void *addr) noexcept
 
 void cpu::load_instr(void *addr) noexcept
 {
+    ptrdiff_t L1i_loc = -1, L2_loc = -1;
+
     do {
         if (auto [found, s, loc] = L1i.load(addr); found) {
-
+            /* Instruction data block found in L1, return */
+            if (s != Invalid)
+                break;
+            L1d_loc = loc;
         }
 
         if (auto [found, s, loc] = L2.load(addr); found) {
+            if (s != Invalid && L1d_loc >= 0) {
+                L1d.update(L1d_loc, s, true);
+                break;
+            } else if (s != Invalid) {
+                L1d.insert(addr, s);
+                break;
+            }
+            L2_loc = loc;
+        }
 
+        if (auto [found, s, loc] = L3.load(addr); found) {
+            directory &dir = system::instance().access_dir();
+            dirent &ent = dir.entries[loc];
+
+            if (s == Invalid) {
+                /**
+                 * If entry is invalid, update L3 with data block
+                 * from RAM
+                 */
+                ent.valid = 1;
+                ent.dirty = 0;
+                L3.update(loc, Shared, true);
+            }
+            /**
+             * Mark that the current processor now has the data block
+             * present in a private cache
+             */
+            ent.bitmap |= (1ull << id);
+
+            if (L2_loc >= 0)
+                L2.update(L2_loc, Shared, true);
+            else if (auto [res, victim, _] = L2.insert(addr, Shared);
+                     res >= WriteBack) {
+                assert(res != WriteThrough);
+                auto [expect, _, evictloc] = L3.find(victim);
+                assert(expect);
+                
+                /**
+                 * Evicting line from L2 caused a write back to L3. Mark
+                 * that the written back data block in L3 is now dirty,
+                 * and it is now longer present for this processor.
+                 * Because the block was written back (dirty), it should
+                 * not be present in any other private cache.
+                 */
+                dirent &evictent = dir.entries[evictloc];
+                evictent.dirty |= 1;
+                evictent.bitmap ^= (1ull << id);
+                assert(!evictent.bitmap);
+                
+                /**
+                 * No other processor has the evicted data block in a
+                 * private cache if it was written back, so it can be
+                 * safely shared.
+                 */
+                L3.lines[evictloc].state = Shared;
+            }
+
+            if (L1d_loc >= 0)
+                L1d.update(L1d_loc, Shared, true);
+            else
+                L1d.insert(addr, Shared);
+        } else /* Not found in L3 */ {
+            ptrdiff_t L3_loc = -1;
+            directory &dir = system::instance().access_dir();
+
+            if (auto [res, victim, evictloc] = L3.insert(addr, Shared);
+                res != NoEvict) {
+                L3_loc = evictloc;
+                dirent &evictent = dir.entries[evictloc];
+
+                if (WriteThrough) {
+                    assert(ptp(victim, evictent.bitmap, BusFlush) == Flush);
+                    auto [evict_res, _] = L3.evict(evictloc, addr, Shared);
+                    /**
+                     * Block was written through to L3 so now evicting it
+                     * should cause the final write back to main memory
+                     * to occur.
+                     */
+                    asert(evivt_res == WriteBack);
+                    memset(&evictent, 0, sizeof(dirent));
+                } else if (WriteBack) {
+                    assert(ptp(victim, evictent.bitmap, BusInv) == InvAck);
+                    memset(&evictent, 0, sizeof(dirent));
+                }
+            }
+
+            if (L2_loc >= 0)
+                L2.update(L2_loc, Shared, true);
+            else if (auto [res, victim, _] = L2.insert(addr, Shared);
+                     res != NoEvict) {
+                auto [expect, _, evictloc] = L3.find(victim);
+                assert(expect);
+                assert(res != WriteThrough);
+
+                dirent &evictent = dir.entries[evictloc];
+                evictent.bitmap ^= (1ull << id);
+                if (res == WriteBack)
+                    evictent.dirty |= 1;
+
+                L3.lines[evictloc].state = Shared;
+            }
+
+            if (L1d_loc >= 0)
+                L1d.update(L1d_loc, Shared, true);
+            else
+                L1d.insert(addr, Shared);
+            
         }
     } while (0);
 }
@@ -770,7 +1167,7 @@ directory::directory(size_t size, size_t block_size) noexcept
 {}
 
 system::system() noexcept
-    : L3(l3_size, l3_blk_size, l3_assoc, false)
+    : L3(l3_size, l3_blk_size, l3_assoc, SharedCache)
     , directory(l3_size, l3_blk_size)
     , bus_transactions(0u)
 {
@@ -779,7 +1176,7 @@ system::system() noexcept
 
 system::~system() noexcept
 {
-    u64 L1i_totals[4]{};
+    u64 L1i_totals[3]{};
     u64 L1d_totals[6]{};
     u64 L2_totals[6]{};
 
@@ -787,7 +1184,6 @@ system::~system() noexcept
         L1i_totals[0] += proc.L1i.stats.rd_hits;
         L1i_totals[1] += proc.L1i.stats.rd_misses;
         L1i_totals[2] += proc.L1i.stats.evictions;
-        L1i_totals[3] += proc.L1i.stats.write_backs;
 
         L1d_totals[0] += proc.L1d.stats.wr_hits;
         L1d_totals[1] += proc.L1d.stats.wr_misses;
@@ -808,6 +1204,10 @@ system::~system() noexcept
     u64 loads           = L1i_totals[0] + L1i_totals[1] + 
                           L1d_totals[2] + L1d_totals[3];
     u64 stores          = L1d_totals[0] + L1d_totals[1];
+    u64 evictions       = L1i_totals[2] + L1d_totals[4] +
+                          L2_totals[4] + L3.stats.evictions;
+    u64 write_backs     = L1d_totals[5] + L2_totals[5] + 
+                          L3.stats.write_backs;
     
     f64 pct_l1i_hits = static_cast<f64>(L1i_totals[0]) /
                        static_cast<f64>(L1i_totals[0] +
@@ -835,37 +1235,71 @@ system::~system() noexcept
                                        L3.stats.rd_misses);
 
     std::cout << "Cache Summary:\n\n"
-              << "INSTRUCTIONS:     " << instructions       << '\n'
-              << "MEMORY ACCESSES:  " << loads + stores     << '\n'
-              << "TOTAL LOADS:      " << loads              << '\n'
-              << "TOTAL STORES:     " << stores             << '\n'
+              << "INSTRUCTIONS:     " << instructions           << '\n'
+              << "MEMORY ACCESSES:  " << loads + stores         << '\n'
+              << "LOADS:            " << loads                  << '\n'
+              << "STORES:           " << stores                 << '\n'
+              << "EVICTIONS:        " << evictions              << '\n'
+              << "WRITE BACKS:      " << write_backs            << '\n'
+              << "BUS TRANSACTIONS: " << bus_transactions       << '\n'
               << '\n'
               << "L1 Data Summary:\n"
-              << "L1d WRITE HITS:   " << L1d_totals[0]      << '\n'
-              << "L1d WRITE MISSES: " << L1d_totals[1]      << '\n'
-              << "L1d READ HITS:    " << L1d_totals[2]      << '\n'
-              << "L1d READ MISSES:  " << L1d_totals[3]      << '\n'
-              << "PERCENT L1d HITS: " << pct_l1d_hits       << '\n'
+              << "L1d WRITE HITS:   " << L1d_totals[0]          << '\n'
+              << "L1d WRITE MISSES: " << L1d_totals[1]          << '\n'
+              << "L1d READ HITS:    " << L1d_totals[2]          << '\n'
+              << "L1d READ MISSES:  " << L1d_totals[3]          << '\n'
+              << "PERCENT L1d HITS: " << pct_l1d_hits           << '\n'
+              << "L1d EVICTIONS:    " << L1d_totals[4]          << '\n'
+              << "L1d WRITE BACKS:  " << L1d_totals[5]          << '\n'
               << '\n'
               << "L1 Instruction Summary:\n"
-              << "L1i READ HITS:    " << L1i_totals[0]      << '\n'
-              << "L1i READ MISSES:  " << L1i_totals[1]      << '\n'
-              << "PERCENT L1i HITS: " << pct_l1i_hits       << '\n'
+              << "L1i READ HITS:    " << L1i_totals[0]          << '\n'
+              << "L1i READ MISSES:  " << L1i_totals[1]          << '\n'
+              << "PERCENT L1i HITS: " << pct_l1i_hits           << '\n'
+              << "L1i EVICTIONS:    " << L1i_totals[2]          << '\n'
               << '\n'
               << "L2 Summary:\n"
-              << "L2 WRITE HITS:    " << L2_totals[0]       << '\n'
-              << "L2 WRITE MISSES:  " << L2_totals[1]       << '\n'
-              << "L2 READ HITS:     " << L2_totals[2]       << '\n'
-              << "L2 READ MISSES:   " << L2_totals[3]       << '\n'
-              << "PERCENT L2 HITS:  " << pct_l2_hits        << '\n'
+              << "L2 WRITE HITS:    " << L2_totals[0]           << '\n'
+              << "L2 WRITE MISSES:  " << L2_totals[1]           << '\n'
+              << "L2 READ HITS:     " << L2_totals[2]           << '\n'
+              << "L2 READ MISSES:   " << L2_totals[3]           << '\n'
+              << "PERCENT L2 HITS:  " << pct_l2_hits            << '\n'
+              << "L2 EVICTIONS:     " << L2_totals[4]           << '\n'
+              << "L2 WRITE BACKS:   " << L2_totals[5]           << '\n'
               << '\n'
               << "L3 Summary:\n"
-              << "L3 WRITE HITS:    " << L3.stats.wr_hits   << '\n'
-              << "L3 WRITE MISSES:  " << L3.stats.wr_misses << '\n'
-              << "L3 READ HITS:     " << L3.stats.rd_hits   << '\n'
-              << "L3 READ MISSES:   " << L3.stats.rd_misses << '\n'
-              << "PERCENT L3 HITS:  " << pct_l3_hits        << '\n'
-              << '\n';
+              << "L3 WRITE HITS:    " << L3.stats.wr_hits       << '\n'
+              << "L3 WRITE MISSES:  " << L3.stats.wr_misses     << '\n'
+              << "L3 READ HITS:     " << L3.stats.rd_hits       << '\n'
+              << "L3 READ MISSES:   " << L3.stats.rd_misses     << '\n'
+              << "PERCENT L3 HITS:  " << pct_l3_hits            << '\n'
+              << "L3 EVICTIONS:     " << L3.stats.evictions     << '\n'
+              << "L3 WRITE BACKS:   " << L3.stats.write_backs   << '\n';
 }
 
+auto system::access_cpus() noexcept -> std::array<cpu, ncpus> &
+{
+    return cpus;
+}
+
+auto system::access_dir() noexcept -> directory &
+{
+    return dir;
+}
+
+auto system::access_L3() noexcept -> cache &
+{
+    return L3;
+}
+
+void system::acquire_bus() noexcept
+{
+    bus.lock();
+    bus_transcations++;
+}
+
+void system::release_bus() noexcept
+{
+    bus.unlock();
+}
 } // cachesim

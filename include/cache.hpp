@@ -26,7 +26,7 @@ using ptrdiff_t = std::ptrdiff_t;
 
 namespace cachesim {
 enum request : u8 {
-    BusRd, BusRdX, BusUpgr, Inv
+    BusRd, BusRdX, BusUpgr, BusInv, BusFlush
 };
 
 enum response : u8 {
@@ -44,9 +44,16 @@ enum cache_state : u8 {
 };
 
 enum evict_result : u8 {
-    None            = 0x0,
-    WriteBack       = 0x1,
-    WriteThrough    = 0x2
+    NoEvict         = 0x0,
+    Evict           = 0x1,
+    WriteBack       = 0x2,
+    WriteThrough    = 0x3
+};
+
+enum cache_type : u8 {
+    PrivateCache,
+    BoundaryCache,
+    SharedCache
 };
 
 struct cache_profile {
@@ -79,7 +86,7 @@ private:
     u32                     assoc;
     u8                      n_offbits;
     u8                      n_ixbits;
-    bool                    local;
+    cache_type              type;
     
     friend class cpu;
     friend class system;
@@ -87,7 +94,7 @@ private:
     std::pair<u64, u64> decompose(void *addr) const noexcept;
 public:
     cache() = default;
-    cache(size_t size, size_t block_size, u32 assoc, bool local) noexcept;
+    cache(size_t sz, size_t blk_sz, u32 assoc, cache_type ty) noexcept;
 
     bool contains(void *addr, bool find_invalid) const noexcept;
     std::tuple<bool, cache_state, ptrdiff_t> find(void *addr) const noexcept;
@@ -97,10 +104,11 @@ public:
     
     ptrdiff_t elect(void *addr) noexcept;
     
-    std::pair<evict_result, u64> evict(ptrdiff_t loc, void *addr, 
-                                       cache_state state) noexcept;
-    std::tuple<evict_result, u64, ptrdiff_t> insert(void *addr, 
-                                                    cache_state state) noexcept;
+    std::pair<evict_result, u64> 
+    evict(ptrdiff_t loc, void *addr, cache_state state) noexcept;
+
+    std::tuple<evict_result, u64, ptrdiff_t> 
+    insert(void *addr, cache_state state) noexcept;
 
     void update(ptrdiff_t loc, cache_state state, bool use) noexcept;
     void update(void *addr, cache_state state, bool use) noexcept;
@@ -118,10 +126,14 @@ public:
     response recvBusUpgr(void *addr) noexcept;
     response recvBusRdX(void *addr) noexcept;
     response recvBusRd(void *addr) noexcept;
+    response recvBusInv(void *addr) noexcept;
+    response recvBusFlush(void *addr) noexcept;
     response snoop(void *addr, request brq) noexcept;
     
     response ptp(void *addr, u32 bitmap, request brq) noexcept;
     response bcast(void *addr, request brq) noexcept;
+
+    void insert(cache &c, void *addr, cache_state state) noexcept;
     
     void load_data(void *addr) noexcept;
     void store_data(void *addr) noexcept;
@@ -160,20 +172,12 @@ public:
         return sys;
     }
     
-    auto access_cpus() noexcept -> std::array<cpu, ncpus> & { return cpus; }
-    auto access_dir() noexcept -> directory & { return dir; }
-    auto access_L3() noexcept -> cache & { return L3; }
+    auto access_cpus() noexcept -> std::array<cpu, ncpus> &;
+    auto access_dir() noexcept -> directory &;
+    auto access_L3() noexcept -> cache &;
 
-    void acquire_bus() noexcept
-    {
-        bus.lock();
-        bus_transactions++;
-    }
-
-    void release_bus() noexcept
-    {
-        bus.unlock();
-    }
+    void acquire_bus() noexcept;
+    void release_bus() noexcept;
 };
 } // cachesim
 #endif // __CACHE_HPP__
