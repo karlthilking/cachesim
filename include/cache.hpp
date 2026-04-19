@@ -42,6 +42,12 @@ using response = u8;
 #define ShareAck    0x4
 #define Flush       0x8
 
+#define RESPONSE_STRING(rsp) \
+    (((rsp) == InvAck)   ? "(response=InvAck)"   : \
+     ((rsp) == NullAck)  ? "(response=NullAck)"  : \
+     ((rsp) == ShareAck) ? "(response=ShareAck)" : \
+     ((rsp) == Flush)    ? "(response=Flush)"    : "")
+
 using cache_state = u8;
 #define Modified    0x0
 #define Exclusive   0x1
@@ -69,7 +75,14 @@ struct cache_profile {
     u32 evictions;
     u32 write_backs;
 
-    constexpr cache_profile() = default;
+    constexpr cache_profile() noexcept
+        : wr_hits(0u)
+        , rd_hits(0u)
+        , wr_misses(0u)
+        , rd_misses(0u)
+        , evictions(0u)
+        , write_backs(0u)
+    {}
 };
 
 struct cache_line {
@@ -78,7 +91,9 @@ struct cache_line {
     u64 use     : 1;    // use bit (LRU approximation)
 
     constexpr cache_line() noexcept
-        : tag(0u), state(Invalid), use(0u)
+        : tag(0u)
+        , state(Invalid)
+        , use(0u)
     {}
 };
 
@@ -155,7 +170,9 @@ struct dirent {
     u32 valid   : 1;
 
     constexpr dirent() noexcept
-        : bitmap(0u), dirty(0u), valid(0u)
+        : bitmap(0u)
+        , dirty(0u)
+        , valid(0u)
     {}
 };
 
@@ -166,11 +183,11 @@ struct directory {
 
 class system {
 private:
-    std::array<cpu, ncpus>  cpus;
-    cache                   L3;
-    directory               dir;
-    std::mutex              bus;
-    u32                     bus_transactions;
+    std::array<cpu, ncpus>      cpus;
+    cache                       L3;
+    directory                   dir;
+    std::mutex                  bus;
+    u32                         bus_transactions;
 
     system() noexcept;
     ~system() noexcept;
@@ -192,4 +209,7 @@ public:
     void initiate_transaction() noexcept;
 };
 } // cachesim
+
+void process(void *addr, bool write, bool data);
+
 #endif // __CACHE_HPP__

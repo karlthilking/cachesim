@@ -4,7 +4,9 @@
 #include <iterator>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
+#include <sched.h>
 #include "../include/params.hpp"
 #include "../include/cache.hpp"
 
@@ -885,8 +887,14 @@ void cpu::insert(cache &c, ptrdiff_t loc, void *addr,
              * back to main memory.
              */
             cache &L3 = system::instance().access_L3();
-            assert(ptp(reinterpret_cast<void *>(victim), 
-                       ent.bitmap, BusFlush) == Flush);
+            response rsp = ptp(reinterpret_cast<void *>(victim),
+                               ent.bitmap, BusFlush); 
+
+            if (rsp != Flush) {
+                std::cerr << "[Error] BusFlush response != Flush "
+                          << RESPONSE_STRING(rsp) << std::endl;
+                abort();
+            }
 
             auto [evict_res, _] = L3.evict(evictloc, addr, state);
             assert(evict_res == WriteBack);
@@ -1271,7 +1279,8 @@ auto system::access_dir() noexcept -> directory &
 
 /**
  * system::access_L3()
- *  Access the system's level 3 cache (shared).
+ *  Access the system's L3 (shared) cache, assuming that the cpu
+ *  accessing the L3 cache has already acquired the bus.
  */
 auto system::access_L3() noexcept -> cache &
 {
@@ -1300,8 +1309,26 @@ void system::release_bus() noexcept
     bus.unlock();
 }
 
+/**
+ * system::initiate_transaction()
+ *  Caller notifies that a bus transaction is being initiated
+ */
 void system::initiate_transaction() noexcept 
 {
     bus_transactions++; 
 }
 } // cachesim
+
+void process(void *addr, bool write, bool data)
+{
+    int cpuid = sched_getcpu();
+    cachesim::system &sys = cachesim::system::instance();
+    cachesim::cpu &proc = sys.access_cpu(cpuid);
+
+    if (write && data)
+        proc.store_data(addr);
+    else if (data)
+        proc.load_data(addr);
+    else
+        proc.load_instr(addr);
+}

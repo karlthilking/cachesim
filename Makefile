@@ -3,17 +3,18 @@ CXXFLAGS = -std=c++23 -g3 -O0 -fPIC
 SOURCE 		= ./src
 INCLUDE 	= ./include
 BIN			= ./bin
-PROGRAMS 	= libcache.so
+TEST		= ./test
+PROGRAMS 	= libcache.so inject
 
 MAKEFLAGS += --no-print-directory
 
 all: $(PROGRAMS)
 
-libcache.so: $(SOURCE)/libcache.cpp
-	g++ $(CXXFLAGS) -c $(SOURCE)/cache.cpp -o cache.o
-	g++ $(CXXFLAGS) -c $< -o libcache.o
-	g++ $(CXXFLAGS) -shared libcache.o cache.o -o $@
-	@(rm -f *.o)
+libcache.so: $(SOURCE)/cache.cpp
+	g++ $(CXXFLAGS) -shared -o $@ $<
+
+%: $(TEST)/%.cpp
+	g++ $(CXXFLAGS) -L. -lcache -Wl,-rpath,. -o $@ $<
 
 build:
 	$(BIN)/gen.sh
