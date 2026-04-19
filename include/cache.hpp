@@ -132,8 +132,9 @@ public:
     
     response ptp(void *addr, u32 bitmap, request brq) noexcept;
     response bcast(void *addr, request brq) noexcept;
-
-    void insert(cache &c, void *addr, cache_state state) noexcept;
+    
+    void insert(cache &c, ptrdiff_t loc, void *addr, 
+                cache_state state, bool data) noexcept;
     
     void load_data(void *addr) noexcept;
     void store_data(void *addr) noexcept;
@@ -172,12 +173,15 @@ public:
         return sys;
     }
     
+    auto access_cpu(u32 cpuid) noexcept -> cpu &;
     auto access_cpus() noexcept -> std::array<cpu, ncpus> &;
+    
     auto access_dir() noexcept -> directory &;
     auto access_L3() noexcept -> cache &;
 
     void acquire_bus() noexcept;
     void release_bus() noexcept;
+    void initiate_transaction() noexcept;
 };
 } // cachesim
 #endif // __CACHE_HPP__
