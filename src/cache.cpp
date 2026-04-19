@@ -378,24 +378,21 @@ void cache::update(void *addr, cache_state state, bool use) noexcept
         it->use |= 1;
 }
 
-
-/**
- * cpu::cpu()
- *  Constructs a cpu with a unique identifier and two levels of private cache
- *  where the first level cache is split between instruction and data, and
- *  the second level private cache is unified.
- */
-cpu::cpu(u32 id) noexcept
+cpu::cpu() noexcept
     : sem(0)
     , L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache)
     , L1i(l1i_size, l1i_blk_size, l1i_assoc, PrivateCache)
     , L2(l2_size, l2_blk_size, l2_assoc, BoundaryCache)
-    , id(id)
+    , id(0u)
+{}
+
+void cpu::start(u32 cpuid) noexcept
 {
+    id = cpuid;
     worker = std::thread([&]{
         for (;;) {
-            sem.acquire();
             header h;
+            sem.acquire();
             {
                 std::scoped_lock lock(mtx);
                 h = std::move(tasks.front());
@@ -1162,9 +1159,8 @@ system::system() noexcept
     , dir(l3_size, l3_blk_size)
     , bus_transactions(0u)
 {
-    cpus.reserve(ncpus);
     for (auto i = 0u; i < ncpus; i++)
-        cpus.emplace_back(i);
+        cpus[i].start(i);
 }
 
 system::~system() noexcept
@@ -1175,6 +1171,7 @@ system::~system() noexcept
 
     for (auto &proc : cpus) {
         proc.enqueue(nullptr, false, false, true);
+        proc.worker.join();
 
         L1i_totals[0] += proc.L1i.stats.rd_hits;
         L1i_totals[1] += proc.L1i.stats.rd_misses;
@@ -1286,7 +1283,7 @@ auto system::access_cpu(u32 cpuid) noexcept -> cpu &
  *  Access system's cpus in order to initiate a bus transaction or
  *  send a bus request.
  */
-auto system::access_cpus() noexcept -> std::vector<cpu> &
+auto system::access_cpus() noexcept -> std::array<cpu, ncpus> &
 {
     return cpus;
 }

@@ -31,6 +31,8 @@ using f32       = float;
 using f64       = double;
 #endif
 
+#define max_sem_count   std::numeric_limits<i32>::max()
+
 using size_t    = std::size_t;
 using ptrdiff_t = std::ptrdiff_t;
 
@@ -178,21 +180,23 @@ struct header {
 
 class cpu {
 private:
-    std::queue<header>          tasks;
-    std::mutex                  mtx;
-    std::counting_semaphore<>   sem;
-    std::thread                 worker;
-    cache                       L1d;
-    cache                       L1i;
-    cache                       L2;
-    u32                         id;
+    std::queue<header>                      tasks;
+    std::mutex                              mtx;
+    std::thread                             worker;
+    std::counting_semaphore<max_sem_count>  sem;
+    cache                                   L1d;
+    cache                                   L1i;
+    cache                                   L2;
+    u32                                     id;
 
     friend class system;
 public:
-    cpu(u32 id) noexcept;
+    cpu() noexcept;
+    void start(u32 cpuid) noexcept;
     
     cpu(const cpu &other) = delete;
     cpu &operator=(const cpu &other) = delete;
+    
     cpu(cpu &&other) = delete;
     cpu &operator=(cpu &&other) = delete;
     
@@ -216,7 +220,7 @@ public:
     template<typename... Args>
     void enqueue(Args &&...args) noexcept
     {
-        std::scoped_lock(mtx);
+        std::scoped_lock lock(mtx);
         tasks.emplace(std::forward<Args>(args)...);
         sem.release();
     }
@@ -241,11 +245,11 @@ struct directory {
 
 class system {
 private:
-    std::vector<cpu>            cpus;
-    cache                       L3;
-    directory                   dir;
-    std::mutex                  bus;
-    u32                         bus_transactions;
+    std::array<cpu, ncpus>  cpus;
+    cache                   L3;
+    directory               dir;
+    std::mutex              bus;
+    u32                     bus_transactions;
 
     system() noexcept;
     ~system() noexcept;
@@ -257,7 +261,7 @@ public:
     }
     
     auto access_cpu(u32 cpuid) noexcept -> cpu &;
-    auto access_cpus() noexcept -> std::vector<cpu> &;
+    auto access_cpus() noexcept -> std::array<cpu, ncpus> &;
     
     auto access_dir() noexcept -> directory &;
     auto access_L3() noexcept -> cache &;
