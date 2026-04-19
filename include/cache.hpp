@@ -7,7 +7,7 @@
 #include <tuple>
 #include <utility>
 #include <numeric>
-#include <stdfloat>
+#include <mutex>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -18,9 +18,16 @@ using i32       = std::int32_t;
 using u32       = std::uint32_t;
 using i64       = std::int64_t;
 using u64       = std::uint64_t;
-using f16       = std::float16_t;
+
+#if defined(__STDCPP_FLOAT32_T__) && defined(__STDCPP_FLOAT64_T__)
+#include <stdfloat>
 using f32       = std::float32_t;
 using f64       = std::float64_t;
+#else
+using f32       = float;
+using f64       = double;
+#endif
+
 using size_t    = std::size_t;
 using ptrdiff_t = std::ptrdiff_t;
 
@@ -29,19 +36,17 @@ enum request : u8 {
     BusRd, BusRdX, BusUpgr, BusInv, BusFlush
 };
 
-enum response : u8 {
-    InvAck      = 0x1, 
-    NullAck     = 0x2,
-    ShareAck    = 0x4,
-    Flush       = 0x8
-};
+using response = u8;
+#define InvAck      0x1
+#define NullAck     0x2
+#define ShareAck    0x4
+#define Flush       0x8
 
-enum cache_state : u8 {
-    Modified    = 0x0,
-    Exclusive   = 0x1,
-    Shared      = 0x2,
-    Invalid     = 0x3
-};
+using cache_state = u8;
+#define Modified    0x0
+#define Exclusive   0x1
+#define Shared      0x2
+#define Invalid     0x3
 
 enum evict_result : u8 {
     NoEvict         = 0x0,
@@ -120,7 +125,10 @@ private:
     cache   L1i;
     cache   L2;
     u32     id;
+
+    friend class system;
 public:
+    cpu() = default;
     cpu(u32 id) noexcept;
     
     response recvBusUpgr(void *addr) noexcept;

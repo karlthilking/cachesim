@@ -1,15 +1,23 @@
-CXXFLAGS = -g3 -O0
+CXXFLAGS = -std=c++23 -g3 -O0 -fPIC
 
 SOURCE 		= ./src
 INCLUDE 	= ./include
-PROGRAMS 	= libcachesim.so cachesim
-all 		= $(PROGRAMS)
+BIN			= ./bin
+PROGRAMS 	= libcache.so
 
-%.so: $(SOURCE)/%.cpp
-	g++ $(CXXFLAGS) -shared -fPIC -o $@ $<
+MAKEFLAGS += --no-print-directory
 
-%: $(SOURCE)/%.cpp
-	g++ $(CXXFLAGS) -o $@ $<
+all: $(PROGRAMS)
+
+libcache.so: $(SOURCE)/libcache.cpp
+	g++ $(CXXFLAGS) -c $(SOURCE)/cache.cpp -o cache.o
+	g++ $(CXXFLAGS) -c $< -o libcache.o
+	g++ $(CXXFLAGS) -shared libcache.o cache.o -o $@
+	@(rm -f *.o)
+
+build:
+	$(BIN)/gen.sh
+	@(make all)
 
 clean:
-	rm -f $(PROGRAMS) *.o
+	rm -f $(PROGRAMS) *.o *.so

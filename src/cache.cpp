@@ -4,6 +4,7 @@
 #include <iterator>
 #include <cassert>
 #include <cstring>
+#include <iostream>
 #include "../include/params.hpp"
 #include "../include/cache.hpp"
 
@@ -17,8 +18,8 @@ namespace cachesim {
  */
 std::pair<u64, u64> cache::decompose(void *addr) const noexcept
 {
-    auto index = (reinterpret_cast<u64>(addr) & set_mask) >> nr_offbits;
-    auto tag = reinterpret_cast<u64>(addr) >> (nr_ixbits + nr_offbits);
+    auto index = (reinterpret_cast<u64>(addr) & set_mask) >> n_offbits;
+    auto tag = reinterpret_cast<u64>(addr) >> (n_ixbits + n_offbits);
 
     return {index, tag};
 }
@@ -39,9 +40,9 @@ cache::cache(size_t sz, size_t blk_sz, u32 assoc, cache_type ty) noexcept
     , type(ty)
 {
     auto num_sets = sz / (blk_sz * assoc);
-    nr_offbits = std::popcount(blk_sz - 1);
-    nr_ixbits = std::popcount(num_sets - 1);
-    set_mask = (num_sets - 1) << nr_offbits;
+    n_offbits = std::popcount(blk_sz - 1);
+    n_ixbits = std::popcount(num_sets - 1);
+    set_mask = (num_sets - 1) << n_offbits;
 }
 
 /**
@@ -59,7 +60,7 @@ bool cache::contains(void *addr, bool find_invalid) const noexcept
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
 
-    auto it = std::ranges::find_if(set, [](const auto &line) {
+    auto it = std::ranges::find_if(set, [tag](const auto &line) {
         return line.tag == tag;
     });
 
@@ -83,12 +84,12 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::find(void *addr) const noexcept
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
 
-    auto it = std::ranges::find_if(set, [](const auto &line) { 
+    auto it = std::ranges::find_if(set, [tag](const auto &line) { 
         return line.tag == tag;
     });
 
     if (it != set.end())
-        return {true, it->state, std::distance(lines.begin(), it)};
+        return {true, it->state, &*it - lines.data()};
 
     return {false, Invalid, -1};
 }
@@ -129,11 +130,11 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::load(void *addr) noexcept
          * that another processor has a dirty copy in a private cache.
          */
         if (state == Invalid || (state == Modified && type == SharedCache)) {
-            stats.rd_missess++;
+            stats.rd_misses++;
             return {false, state, loc};
         }
         
-        lines[loc].u |= 1;
+        lines[loc].use |= 1;
         stats.rd_hits++;
         return {true, state, loc};
     }
@@ -181,7 +182,7 @@ std::tuple<bool, cache_state, ptrdiff_t> cache::store(void *addr) noexcept
             return {false, state, loc};
         }
 
-        lines[loc].u |= 1;
+        lines[loc].use |= 1;
         stats.wr_hits++;
         return {true, state, loc};
     }
@@ -208,11 +209,11 @@ ptrdiff_t cache::elect(void *addr) noexcept
     });
 
     if (it != set.end())
-        return std::distance(lines.begin(), it);
+        return &*it - lines.data();
 
     for (auto i = clock_hands[index];; i = (i + 1) % set.size()) {
-        if (set[i].u) {
-            set[i].u = 0;
+        if (set[i].use) {
+            set[i].use = 0;
             continue;
         }
         return (index * assoc) + i;
@@ -240,7 +241,7 @@ std::pair<evict_result, u64> cache::evict(ptrdiff_t loc, void *addr,
     auto [index, tag] = decompose(addr);
     cache_line &victim = lines[loc];
     auto ret = std::pair<evict_result, u64>{
-        Default, ((tag << nr_ixbits) | index) << nr_offbits
+        NoEvict, ((tag << n_ixbits) | index) << n_offbits
     };
     
     if (victim.state == Modified && type != SharedCache) {
@@ -289,7 +290,7 @@ std::pair<evict_result, u64> cache::evict(ptrdiff_t loc, void *addr,
      */
     victim.tag = tag;
     victim.state = state;
-    victim.u = 1;
+    victim.use = 1;
 
     stats.evictions++;
     return ret;
@@ -331,7 +332,7 @@ cache::insert(void *addr, cache_state state) noexcept
     
     lines[loc].tag = tag;
     lines[loc].state = state;
-    lines[loc].u = 1;
+    lines[loc].use = 1;
     
     return {NoEvict, 0u, loc};
 }
@@ -348,7 +349,7 @@ void cache::update(ptrdiff_t loc, cache_state state, bool use) noexcept
 {
     lines[loc].state = state;
     if (use)
-        lines[loc].u |= 1;
+        lines[loc].use |= 1;
 }
 
 /**
@@ -365,14 +366,14 @@ void cache::update(void *addr, cache_state state, bool use) noexcept
     auto [index, tag] = decompose(addr);
     auto set = std::span{lines.data() + (index * assoc), assoc};
 
-    auto it = std::ranges::find_if(set, [](const auto &line) {
+    auto it = std::ranges::find_if(set, [tag](const auto &line) {
         return line.tag == tag;
     });
     assert(it != set.end());
 
     it->state = state;
     if (use)
-        it->u |= 1;
+        it->use |= 1;
 }
 
 
@@ -411,7 +412,7 @@ response cpu::recvBusUpgr(void *addr) noexcept
     if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
         assert(s == Shared);
         L1d.lines[loc].state = Invalid;
-        L2.update(addr, Invalid);
+        L2.update(addr, Invalid, false);
         return InvAck;
     } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
         assert(s == Shared);
@@ -437,9 +438,11 @@ response cpu::recvBusUpgr(void *addr) noexcept
  */
 response cpu::recvBusRdX(void *addr) noexcept
 {
+    cache &L3 = system::instance().access_L3();
+
     if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
         L1d.lines[loc].state = Invalid;
-        L2.update(addr, Invalid);
+        L2.update(addr, Invalid, false);
         /**
          * If a private copy of the data block that the requesting processor
          * wishes to acquire read/write access for is in the modified state,
@@ -465,7 +468,7 @@ response cpu::recvBusRdX(void *addr) noexcept
              * longer have the block present. Therefore, this cpu should
              * unmark the present bit in the directory entry's bitmap.
              */
-            assert(ent.bitamp & (1ull << id));
+            assert(ent.bitmap & (1ull << id));
             ent.bitmap ^= (1ull << id);
 
             return Flush;
@@ -513,10 +516,12 @@ response cpu::recvBusRdX(void *addr) noexcept
  */
 response cpu::recvBusRd(void *addr) noexcept
 {
+    cache &L3 = system::instance().access_L3();
+
     if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
         if (s == Modified || s == Exclusive) {
             L1d.lines[loc].state = Shared;
-            L2.update(addr, Shared);
+            L2.update(addr, Shared, false);
             if (s == Modified) {
                 L1d.stats.write_backs++;
                 L2.stats.write_backs++;
@@ -539,7 +544,7 @@ response cpu::recvBusRd(void *addr) noexcept
         if (s == Modified || s == Exclusive) {
             L2.lines[loc].state = Shared;
             if (s == Modified) {
-                L2.write_backs++;
+                L2.stats.write_backs++;
 
                 auto [expect, L3_state, L3_loc] = L3.find(addr);
                 assert(expect && L3_state == Modified);
@@ -575,11 +580,11 @@ response cpu::recvBusInv(void *addr) noexcept
 {
     if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
         L1d.lines[loc].state = Invalid;
-        L2.update(addr, Invalid);
+        L2.update(addr, Invalid, false);
         return InvAck;
     } else if (auto [found, s, loc] = L1i.find(addr); found && s != Invalid) {
         L1i.lines[loc].state = Invalid;
-        L2.update(addr, Invalid);
+        L2.update(addr, Invalid, false);
         return InvAck;
     } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
         L2.lines[loc].state = Invalid;
@@ -605,6 +610,8 @@ response cpu::recvBusInv(void *addr) noexcept
  */
 response cpu::recvBusFlush(void *addr) noexcept
 {
+    cache &L3 = system::instance().access_L3();
+
     if (auto [found, s, loc] = L1d.find(addr); found && s != Invalid) {
         /**
          * If receiving a bus request to flush a data block, it is assumed
@@ -615,7 +622,7 @@ response cpu::recvBusFlush(void *addr) noexcept
         
         /* Mark the block as invalid */
         L1d.lines[loc].state = Invalid;
-        L2.update(addr, Invalid);
+        L2.update(addr, Invalid, false);
         
         /* Write through to L3 */
         L1d.stats.write_backs++;
@@ -642,8 +649,8 @@ response cpu::recvBusFlush(void *addr) noexcept
     } else if (auto [found, s, loc] = L2.find(addr); found && s != Invalid) {
         assert(s == Modified);
 
-        L2.lines[loc] = Invalid;
-        L2.stats.wr_backs++;
+        L2.lines[loc].state = Invalid;
+        L2.stats.write_backs++;
 
         auto [expect, L3_state, L3_loc] = L3.find(addr);
         assert(expect && L3_state == Modified);
@@ -670,7 +677,7 @@ response cpu::recvBusFlush(void *addr) noexcept
  * @addr: Address corresponding to the sender cpu's bus request
  * @brq: The specific bus request sent by the requesting cpu
  */
-response cpu::snoop(void *addr, request brq)
+response cpu::snoop(void *addr, request brq) noexcept
 {
     switch (brq) {
     case BusRd:
@@ -697,7 +704,7 @@ response cpu::snoop(void *addr, request brq)
  * @bitmap: Bitmap indicating which processors have the block present
  * @brq: The bus request to be broadcasted to processors with the data block
  */
-response cpu::ptp(void *addr, u32 bitmap, request brq)
+response cpu::ptp(void *addr, u32 bitmap, request brq) noexcept
 {
     response rsp = 0u;
     system &sys = system::instance();
@@ -706,7 +713,7 @@ response cpu::ptp(void *addr, u32 bitmap, request brq)
     for (auto i = 0u; i < ncpus; i++, bitmap >>= 1) {
         if (i != id && (bitmap & 1)) {
             cpu &receiver = sys.access_cpu(i);
-            rsp |= receiver.snoop(brq);
+            rsp |= receiver.snoop(addr, brq);
         }
     }
 
@@ -731,7 +738,7 @@ response cpu::bcast(void *addr, request brq) noexcept
     for (auto i = 0u; i < ncpus; i++) {
         if (i != id) {
             cpu &receiver = sys.access_cpu(i);
-            rsp |= reciver.snoop(brq);
+            rsp |= receiver.snoop(addr, brq);
         }
     }
 
@@ -787,7 +794,8 @@ void cpu::insert(cache &c, ptrdiff_t loc, void *addr,
     } else if (c.type == BoundaryCache) {
         cache &L3 = system::instance().access_L3();
         if (auto [res, victim, _] = c.insert(addr, state); res != NoEvict) {
-            auto [expect, _, evictloc] = L3.find(victim);
+            auto [expect, _null, evictloc] 
+                = L3.find(reinterpret_cast<void *>(victim));
             assert(expect && res != WriteThrough);
 
             /**
@@ -799,8 +807,9 @@ void cpu::insert(cache &c, ptrdiff_t loc, void *addr,
                 if (auto [found, s, loc] = L1d.find(addr); found)
                     L1d.update(loc, Invalid, false);
             } else if (auto [found, s, loc] = L1i.find(addr); found)
-                L1i.update(Loc, Invalid, false);
-
+                L1i.update(loc, Invalid, false);
+            
+            directory &dir = system::instance().access_dir();
             dirent &evictent = dir.entries[evictloc];
             /**
              * Mark that this processor no longer has a copy of the
@@ -865,7 +874,8 @@ void cpu::insert(cache &c, ptrdiff_t loc, void *addr,
              * Send request on bus for processors with a private copy
              * of the evicted block to invalidate their copies.
              */
-            assert(ptp(victim, ent.bitmap, BusInv) == InvAck);
+            assert(ptp(reinterpret_cast<void *>(victim), 
+                       ent.bitmap, BusInv) == InvAck);
         } else if (res == WriteThrough) {
             /**
              * Send request on bus for the processor with the private
@@ -874,7 +884,10 @@ void cpu::insert(cache &c, ptrdiff_t loc, void *addr,
              * block is evicted from L3 and its contents are written
              * back to main memory.
              */
-            assert(ptp(victim, ent.bitmap, BusFlush) == Flush);
+            cache &L3 = system::instance().access_L3();
+            assert(ptp(reinterpret_cast<void *>(victim), 
+                       ent.bitmap, BusFlush) == Flush);
+
             auto [evict_res, _] = L3.evict(evictloc, addr, state);
             assert(evict_res == WriteBack);
         }
@@ -955,13 +968,13 @@ void cpu::load_data(void *addr) noexcept
             system::instance().release_bus();
             
             insert(L2, L2_loc, addr, transition, true);
-            insert(L1, L1_loc, addr, transition, true);
+            insert(L1d, L1d_loc, addr, transition, true);
         } else /* Not present in L3 */ {
             insert(L3, -1, addr, Exclusive, true);
             system::instance().release_bus();
 
             insert(L2, L2_loc, addr, Exclusive, true);
-            insert(L1, L1_loc, addr, Exclusive, true);
+            insert(L1d, L1d_loc, addr, Exclusive, true);
         }
     } while (0);
 }
@@ -1015,7 +1028,7 @@ void cpu::store_data(void *addr) noexcept
             else if (hit) {
                 system::instance().acquire_bus();
                 cache &L3 = system::instance().access_L3();
-                directory &dir = system::instance().access_L3();
+                directory &dir = system::instance().access_dir();
 
                 auto [found, L3_state, L3_loc] = L3.find(addr);
                 assert(found && s == L3_state);
@@ -1049,7 +1062,7 @@ void cpu::store_data(void *addr) noexcept
             system::instance().release_bus();
             
             insert(L1d, L1d_loc, addr, Modified, true);
-            insert(L2, L2d_loc, addr, Modified, true);
+            insert(L2, L2_loc, addr, Modified, true);
         } else /* Not found or invalid in L3 */ {
             insert(L3, -1, addr, Modified, true);
             system::instance().release_bus();
@@ -1073,13 +1086,13 @@ void cpu::load_instr(void *addr) noexcept
 
         if (auto [hit, s, loc] = L2.load(addr); loc != -1) {
             if (hit) {
-                insert(Li, L1i_loc, addr, s, true);
+                insert(L1i, L1i_loc, addr, s, true);
                 break;
             }
             L2_loc = loc;
         }
         
-        system::instance().acquire_bus(false);
+        system::instance().acquire_bus();
         cache &L3 = system::instance().access_L3();
         if (auto [hit, s, loc] = L3.load(addr); loc != -1) {
             if (!hit) {
@@ -1089,20 +1102,20 @@ void cpu::load_instr(void *addr) noexcept
                  * state = I), insert the block into L3 at the position
                  * where a matching tag was found.
                  */
-                insert(L3, loc, addr, transition, true);
+                insert(L3, loc, addr, Shared, true);
             }
-            system::instance().release_bus(false);
+            system::instance().release_bus();
             /* Bring into L2 and L1 */
             insert(L2, L2_loc, addr, Shared, true);
-            insert(L1i, L1_loc, addr, Shared, true);
+            insert(L1i, L1i_loc, addr, Shared, true);
         } else {
             /* Bring in from RAM -> L3 -> L2 -> L1 */
-            system::instance().acquire_bus(false);
+            system::instance().acquire_bus();
             insert(L3, -1, addr, Shared, true);
-            system::instance().release_bus(false);
+            system::instance().release_bus();
 
             insert(L2, L2_loc, addr, Shared, true);
-            insert(L1i, L1_loc, addr, Shared, true);
+            insert(L1i, L1i_loc, addr, Shared, true);
         }
     } while (0);
 }
@@ -1118,7 +1131,7 @@ directory::directory(size_t size, size_t block_size) noexcept
 
 system::system() noexcept
     : L3(l3_size, l3_blk_size, l3_assoc, SharedCache)
-    , directory(l3_size, l3_blk_size)
+    , dir(l3_size, l3_blk_size)
     , bus_transactions(0u)
 {
     std::iota(begin(cpus), end(cpus), 0u);
@@ -1138,16 +1151,16 @@ system::~system() noexcept
         L1d_totals[0] += proc.L1d.stats.wr_hits;
         L1d_totals[1] += proc.L1d.stats.wr_misses;
         L1d_totals[2] += proc.L1d.stats.rd_hits;
-        L1d.totals[3] += proc.L1d.stats.rd_misses;
-        L1d.totals[4] += proc.L1d.stats.evictions;
-        L1d.totals[5] += proc.L1d.stats.write_backs;
+        L1d_totals[3] += proc.L1d.stats.rd_misses;
+        L1d_totals[4] += proc.L1d.stats.evictions;
+        L1d_totals[5] += proc.L1d.stats.write_backs;
 
-        L2.totals[0] += proc.L2.stats.wr_hits;
-        L2.totals[1] += proc.L2.stats.wr_misses;
-        L2.totals[2] += proc.L2.stats.rd_hits;
-        L2.totals[3] += proc.L2.stats.rd_misses;
-        L2.totals[4] += proc.L2.stats.evictions;
-        L2.totals[5] += proc.L2.stats.write_backs;
+        L2_totals[0] += proc.L2.stats.wr_hits;
+        L2_totals[1] += proc.L2.stats.wr_misses;
+        L2_totals[2] += proc.L2.stats.rd_hits;
+        L2_totals[3] += proc.L2.stats.rd_misses;
+        L2_totals[4] += proc.L2.stats.evictions;
+        L2_totals[5] += proc.L2.stats.write_backs;
     }
 
     u64 instructions    = L1i_totals[0] + L1i_totals[1];
