@@ -59,6 +59,12 @@ using cache_state = u8;
 #define Shared      0x2
 #define Invalid     0x3
 
+#define STATE_STRING(s) \
+    (((s) == Modified)  ? "(state=M)"   : \
+     ((s) == Exclusive) ? "(state=E)"   : \
+     ((s) == Shared)    ? "(state=S)"   : \
+     ((s) == Invalid)   ? "(state=I)"   : "")
+
 enum evict_result : u8 {
     NoEvict         = 0x0,
     Evict           = 0x1,
@@ -71,6 +77,16 @@ enum cache_type : u8 {
     BoundaryCache,
     SharedCache
 };
+
+using access = u8;
+#define InvalidAccess   0x0
+#define ReadAccess      0x1
+#define WriteAccess     0x2
+
+using address = u8;
+#define InvalidAddr     0x0
+#define DataAddr        0x1
+#define InstrAddr       0x2
 
 struct cache_profile {
     u32 wr_hits;
@@ -141,28 +157,28 @@ public:
 
 struct header {
     void    *addr;
-    bool    write;
-    bool    data;
+    address addr_type;
+    access  access_type;
     bool    stop;
     
     header() noexcept
         : addr(nullptr)
-        , write(false)
-        , data(false)
+        , addr_type(InvalidAddr)
+        , access_type(InvalidAccess)
         , stop(false)
     {}
 
-    header(void *addr, bool wr, bool data, bool stop) noexcept
+    header(void *addr, address adt, access act, bool stop) noexcept
         : addr(addr)
-        , write(wr)
-        , data(data)
+        , addr_type(adt)
+        , access_type(act)
         , stop(stop)
     {}
 
     header(header &&other) noexcept
         : addr(std::exchange(other.addr, nullptr))
-        , write(other.write)
-        , data(other.data)
+        , addr_type(other.addr_type)
+        , access_type(other.access_type)
         , stop(other.stop)
     {}
 
@@ -170,8 +186,8 @@ struct header {
     {
         if (this != &other) {
             addr = std::exchange(other.addr, nullptr);
-            write = other.write;
-            data = other.data;
+            addr_type = other.addr_type;
+            access_type = other.access_type;
             stop = other.stop;
         }
         return *this;
