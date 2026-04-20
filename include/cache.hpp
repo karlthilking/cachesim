@@ -11,6 +11,7 @@
 #include <semaphore>
 #include <queue>
 #include <thread>
+#include <future>
 #include "params.hpp"
 
 using i8        = std::int8_t;
@@ -31,14 +32,14 @@ using f32       = float;
 using f64       = double;
 #endif
 
-#define max_sem_count   std::numeric_limits<i32>::max()
+#define max_sem_count std::numeric_limits<i32>::max()
 
 using size_t    = std::size_t;
 using ptrdiff_t = std::ptrdiff_t;
 
 namespace cachesim {
 enum request : u8 {
-    BusRd, BusRdX, BusUpgr, BusInv, BusFlush
+    NullRq, BusRd, BusRdX, BusUpgr, BusInv, BusFlush
 };
 
 using response = u8;
@@ -78,15 +79,15 @@ enum cache_type : u8 {
     SharedCache
 };
 
-using access = u8;
-#define InvalidAccess   0x0
-#define ReadAccess      0x1
-#define WriteAccess     0x2
-
-using address = u8;
-#define InvalidAddr     0x0
-#define DataAddr        0x1
-#define InstrAddr       0x2
+using task_descriptor = u8;
+#define NullTask    0x00
+#define LoadTask    0x01
+#define StoreTask   0x02
+#define DataTask    0x04
+#define InstrTask   0x08
+#define DflTask     0x10
+#define SnoopTask   0x20
+#define StopTask    0x40
 
 struct cache_profile {
     u32 wr_hits;
@@ -155,55 +156,66 @@ public:
     void update(void *addr, cache_state state, bool use) noexcept;
 };
 
-struct header {
-    void    *addr;
-    address addr_type;
-    access  access_type;
-    bool    stop;
+struct task {
+    std::promise<response>  promise;
+    void                    *addr;
+    task_descriptor         td;
+    request                 brq;
     
-    header() noexcept
-        : addr(nullptr)
-        , addr_type(InvalidAddr)
-        , access_type(InvalidAccess)
-        , stop(false)
+    task() noexcept = default;
+
+    task(void *addr_, task_descriptor td_, request brq) noexcept
+        : addr(addr), td(td), brq(brq)
     {}
 
-    header(void *addr, address adt, access act, bool stop) noexcept
-        : addr(addr)
-        , addr_type(adt)
-        , access_type(act)
-        , stop(stop)
+    task(void *addr, task_descriptor td, 
+         request brq, std::promise<response> prom) noexcept
+         : promise(std::move(prom)), addr(addr), td(td), brq(brq)
+    {}
+    
+    task(const task &_t) = delete;
+    task &operator=(const task &_t) = delete;
+
+    task(task &&t) noexcept
+        : promise(std::move(t.promise))
+        , addr(std::exchange(t.addr, nullptr))
+        , td(std::exchange(t.td, NullTask))
+        , brq(t.brq)
     {}
 
-    header(header &&other) noexcept
-        : addr(std::exchange(other.addr, nullptr))
-        , addr_type(other.addr_type)
-        , access_type(other.access_type)
-        , stop(other.stop)
-    {}
-
-    header &operator=(header &&other) noexcept
+    task &operator=(task &&t) noexcept
     {
-        if (this != &other) {
-            addr = std::exchange(other.addr, nullptr);
-            addr_type = other.addr_type;
-            access_type = other.access_type;
-            stop = other.stop;
+        if (this != &t) {
+            promise = std::move(t.promise);
+            addr = std::exchange(t.addr, nullptr);
+            td = std::exchange(t.td, NullTask);
+            brq = t.brq;
         }
         return *this;
     }
 };
 
+struct taskcmp {
+    auto operator()(const task &a, const task &b) -> bool
+    {
+        return a.td != SnoopTask && b.td != SnoopTask;
+    }
+};
+
 class cpu {
+public:
+    using task_queue = std::priority_queue<task, std::vector<task>, taskcmp>;
+    using counting_sem = std::counting_semaphore<max_sem_count>;
 private:
-    std::queue<header>                      tasks;
-    std::mutex                              mtx;
-    std::thread                             worker;
-    std::counting_semaphore<max_sem_count>  sem;
-    cache                                   L1d;
-    cache                                   L1i;
-    cache                                   L2;
-    u32                                     id;
+    task_queue      tasks;
+    std::mutex      mtx;
+    std::thread     worker;
+    counting_sem    sem;
+    cache           L1d;
+    cache           L1i;
+    cache           L2;
+    u32             id;
+    bool            stop;
 
     friend class system;
 public:
@@ -233,12 +245,35 @@ public:
     void store_data(void *addr) noexcept;
     void load_instr(void *addr) noexcept;
     
+    /**
+     * enqueue_task():
+     *  Notify cpu of available work (loads, stores)
+     */
     template<typename... Args>
-    void enqueue(Args &&...args) noexcept
+    void enqueue_task(Args &&...args) noexcept
     {
         std::scoped_lock lock(mtx);
         tasks.emplace(std::forward<Args>(args)...);
         sem.release();
+    }
+    
+    /**
+     * enqueue_busrq():
+     *  Notify cpu to snoop a bus request sent over the memory bus by
+     *  adding a snoop request message onto its work queue
+     */
+    template<typename... Args>
+    std::future<response> enqueue_busrq(Args &&...args) noexcept
+    requires std::is_constructible_v<task, Args..., std::promise<response>>
+    {
+        std::promise<response> promise;
+        auto future = promise.get_future();
+        {
+            std::scoped_lock lock(mtx);
+            tasks.emplace(std::forward<Args>(args)..., std::move(promise));
+        }
+        sem.release();
+        return future;
     }
 };
 
@@ -282,7 +317,7 @@ public:
     auto access_dir() noexcept -> directory &;
     auto access_L3() noexcept -> cache &;
 
-    void acquire_bus() noexcept;
+    void acquire_bus(cpu *proc) noexcept;
     void release_bus() noexcept;
     void initiate_transaction() noexcept;
 };
