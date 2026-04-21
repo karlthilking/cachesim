@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <sched.h>
+#include <unistd.h>
 #include "../include/params.hpp"
 #include "../include/cache.hpp"
 
@@ -1276,14 +1277,54 @@ directory::directory(size_t size, size_t block_size) noexcept
 system::system() noexcept
     : L3(l3_size, l3_blk_size, l3_assoc, SharedCache)
     , dir(l3_size, l3_blk_size)
+    , sem(0u)
     , bus_transactions(0u)
 {
     for (auto i = 0u; i < ncpus; i++)
-        cpus[i] = std::move(cpu(i));
+        cpus[i] = cpu(i);
+
+    worker = std::thread([this] {
+        bool stop = false;
+        for (;;) {
+            task t;
+            sem.acquire();
+            {
+                std::scoped_lock lock(mtx);
+                t = std::move(tasks.front());
+                tasks.pop();
+            }
+            if (stop && tasks.empty())
+                return;
+            else if (t.task_type == TASK_STOP) {
+                stop = true;
+                if (tasks.empty())
+                    return;
+                continue;
+            } else {
+                cpu &proc = cpus[t.cpuid];
+                switch (t.task_type) {
+                case STORE_DATA:
+                    proc.store_data(t.addr);
+                    continue;
+                case LOAD_DATA:
+                    proc.load_data(t.addr);
+                    continue;
+                case LOAD_INSTR:
+                    proc.load_instr(t.addr);
+                    continue;
+                default:
+                    assert(0);
+                }
+            }
+        }
+    });
 }
 
 system::~system() noexcept
 {
+    enqueue(TASK_STOP);
+    worker.join();
+
     u64 L1i_totals[3]{};
     u64 L1d_totals[6]{};
     u64 L2_totals[6]{};
@@ -1342,7 +1383,7 @@ system::~system() noexcept
                                        L3.stats.wr_misses + 
                                        L3.stats.rd_misses);
 
-    std::cout << "Cache Summary:\n\n"
+    std::cout << "[CACHE SUMMARY]\n\n"
               << "INSTRUCTIONS:     " << instructions           << '\n'
               << "MEMORY ACCESSES:  " << loads + stores         << '\n'
               << "LOADS:            " << loads                  << '\n'
@@ -1444,22 +1485,27 @@ void system::initiate_transaction() noexcept
 }
 } // cachesim
 
-void process(void *addr, bool write, bool data)
+extern "C" void __cachesim_store_data(void *addr)
 {
     int cpuid = sched_getcpu();
-    assert(cpuid >= 0 && static_cast<u32>(cpuid) < cachesim::ncpus);
+    cachesim::system::instance().enqueue(addr, cpuid, true, true);
+}
 
-    cachesim::system &sys = cachesim::system::instance();
-    cachesim::cpu &proc = sys.access_cpu(cpuid);
+extern "C" void __cachesim_load_data(void *addr)
+{
+    int cpuid = sched_getcpu();
+    cachesim::system::instance().enqueue(addr, cpuid, false, true);
+}
 
-    sys.acquire();
-    {
-        if (write && data)
-            proc.store_data(addr);
-        else if (data)
-            proc.load_data(addr);
-        else
-            proc.load_instr(addr);
-    }
-    sys.release();
+extern "C" void __cachesim_load_instr(void *addr)
+{
+    int cpuid = sched_getcpu();
+    cachesim::system::instance().enqueue(addr, cpuid, false, false);
+}
+
+__attribute__((constructor(101))) static void setup()
+{ 
+    const char *msg = "Setting up cache simulator...\n";
+    write(STDOUT_FILENO, msg, strlen(msg));
+    cachesim::system::instance(); 
 }

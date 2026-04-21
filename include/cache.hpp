@@ -32,7 +32,7 @@ using f32       = float;
 using f64       = double;
 #endif
 
-// #define max_sem_count std::numeric_limits<i32>::max()
+#define max_sem_count std::numeric_limits<i32>::max()
 
 using size_t    = std::size_t;
 using ptrdiff_t = std::ptrdiff_t;
@@ -221,12 +221,61 @@ struct directory {
     directory(size_t size, size_t block_size) noexcept;
 };
 
+#define TASK_LOAD   0x1
+#define TASK_STORE  0x2
+#define TASK_DATA   0x4
+#define TASK_INSTR  0x8
+#define TASK_STOP   0x16
+#define STORE_DATA  (TASK_STORE | TASK_DATA)
+#define LOAD_DATA   (TASK_LOAD | TASK_DATA)
+#define LOAD_INSTR  (TASK_LOAD | TASK_INSTR)
+
+struct task {
+    void    *addr;
+    u32     cpuid;
+    u32     task_type;
+    
+    task() noexcept = default;
+
+    task(u32 type) noexcept
+        : addr(nullptr), cpuid(0u), task_type(type)
+    {}
+
+    task(void *addr, int id, bool write, bool data) noexcept
+        : addr(addr), cpuid(id)
+    {
+        task_type = (write ? TASK_STORE : TASK_LOAD) |
+                    (data ? TASK_DATA : TASK_INSTR);
+    }
+
+    task(task &&other) noexcept
+        : addr(std::exchange(other.addr, nullptr))
+        , cpuid(other.cpuid)
+        , task_type(other.task_type)
+    {}
+
+    task &operator=(task &&other) noexcept
+    {
+        if (this != &other) {
+            addr = std::exchange(other.addr, nullptr);
+            cpuid = other.cpuid;
+            task_type = other.task_type;
+        }
+        return *this;
+    }
+};
+
 class system {
+public:
+    using counting_sem = std::counting_semaphore<max_sem_count>;
 private:
     std::array<cpu, ncpus>  cpus;
     cache                   L3;
     directory               dir;
+    std::queue<task>        tasks;
     std::mutex              mtx;
+    counting_sem            sem;
+    std::thread             worker;
     u32                     bus_transactions;
 
     system() noexcept;
@@ -247,9 +296,28 @@ public:
     void acquire() noexcept;
     void release() noexcept;
     void initiate_transaction() noexcept;
+
+    template<typename... Args>
+    void enqueue(Args &&...args) noexcept
+    requires std::is_constructible_v<task, Args...>
+    {
+        std::scoped_lock lock(mtx);
+        tasks.emplace(std::forward<Args>(args)...);
+        sem.release();
+    }
 };
 } // cachesim
 
-void process(void *addr, bool write, bool data);
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void __cachesim_store_data(void *addr);
+void __cachesim_load_data(void *addr);
+void __cachesim_load_instr(void *addr);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // __CACHE_HPP__

@@ -1,8 +1,8 @@
 CXXFLAGS=-std=c++23 -g -O3 -Wall -Wextra -Werror
-CXXTESTFLAGS=$(CXXFLAGS) -Wno-ignored-qualifiers \
-			 			 -Wno-deprecated-enum-float-conversion
+CXXTESTFLAGS=-Wno-ignored-qualifiers -Wno-deprecated-enum-float-conversion
 LDFLAGS=-std=c++23
-PROGRAMS=libcache.so cachetest matmul
+LLVMFLAGS=-fpass-plugin=./libcachesimpass.so
+PROGRAMS=libcache.so cachetest matmul scan
 MAKEFLAGS += --no-print-directory
 
 SOURCE=./src
@@ -12,27 +12,28 @@ CXXTEST=$(TEST)/cxxtest
 
 all: $(PROGRAMS)
 
-cachetest: cachetest.o cache.o cache.cxxtest.o
-	g++ $(LDFLAGS) $^ -o $@
+lib%.so: $(SOURCE)/%.cpp
+	clang++ -I$(INCLUDE) $(CXXFLAGS) -fPIC -c $< -o %.o
+	clang++ $(LDFLAGS) -shared -fPIC -o $@ %.o
 
-libcache.so: cache.o
-	g++ $(LDFLAGS) -shared -fPIC -o $@ $<
+cachetest: cachetest.o cache.o cache.cxxtest.o
+	clang++ $(LDFLAGS) $^ -o $@
 
 cache.o: $(SOURCE)/cache.cpp
-	g++ -I$(INCLUDE) $(CXXFLAGS) -fPIC -c $< -o $@
+	clang++ -I$(INCLUDE) $(CXXFLAGS) -fPIC -c $< -o $@
 
 cachetest.o: cachetest.cpp
-	g++ -I$(CXXTEST) $(CXXTESTFLAGS) -c $< -o $@
+	clang++ -I$(CXXTEST) $(CXXFLAGS) $(CXXTESTFLAGS) -c $< -o $@
 
 cache.cxxtest.o: cache.cxxtest.cpp
-	g++ -I$(CXXTEST) $(CXXTESTFLAGS) -c $< -o $@
+	clang++ -I$(CXXTEST) $(CXXFLAGS) $(CXXTESTFLAGS) -c $< -o $@
 
 %.cxxtest.cpp: $(TEST)/%.cxxtest.hpp
 	python3 -W ignore $(CXXTEST)/bin/cxxtestgen --part --error-printer \
 			$< -o $@
 
-%: ./programs/%.cpp libcache.so
-	g++ $(CXXFLAGS) -L. -lcache -Wl,-rpath,. -o $@ $<
+%: ./programs/%.cpp libcache.so libcachesimpass.so
+	clang++ $(CXXFLAGS) -L. -lcache -Wl,-rpath,. $(LLVMFLAGS) -o $@ $<
 
 cachetest.cpp:
 	python3 -W ignore $(CXXTEST)/bin/cxxtestgen --root --error-printer \
@@ -42,7 +43,7 @@ build: all
 	@(rm -f *.o cachetest.cpp *.cxxtest.cpp)
 
 clean:
-	rm -f $(PROGRAMS) *cxxtest.cpp cachetest.cpp *.o *.so
+	rm -f $(PROGRAMS) *cxxtest.cpp cachetest.cpp *.o *.so *.ll
 
 
 
