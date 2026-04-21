@@ -99,14 +99,28 @@ public:
         uniform_int_distribution<u64> set_dist(0u, num_sets - 1);
         uniform_int_distribution<u64> off_dist(0u, l1d_blk_size - 1);
 
+        auto repeat = [&](const std::vector<u64> &v, u64 tag) -> bool {
+            bool b = std::any_of(begin(v), end(v), [&](u64 cmp) {
+                auto cmp_tag = cmp >> (n_ixbits + n_tagbits);
+                return cmp_tag == tag;
+            });
+            return b;
+        };
+
         for (auto iter = 0u; iter < 100u; iter++) {
             cache L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache);
+            std::vector<u64> addrs;
             auto set = set_dist(gen);
             
             for (auto i = 0u; i < l1d_assoc; i++) {
                 u64 tag = tag_dist(gen);
+                while (repeat(addrs, tag))
+                    tag = tag_dist(gen);
+
                 u64 off = off_dist(gen);
                 u64 addr = (((tag << n_ixbits) | set) << n_offbits) | off;
+
+                addrs.push_back(addr);
                 auto [res, _r1, _r2] = L1d.insert(
                     reinterpret_cast<void *>(addr), Shared
                 );
@@ -118,6 +132,38 @@ public:
                 reinterpret_cast<void *>(conflict), Shared
             );
             TS_ASSERT(res != NoEvict);
+        }
+        
+        cache L1d(l1d_size, l1d_blk_size, l1d_assoc, PrivateCache);
+        vector<vector<u64>> addrs(num_sets, vector<u64>(l1d_assoc));
+        for (auto set = 0u; set < num_sets; set++) {
+            for (auto i = 0u; i < l1d_assoc; i++) {
+                u64 tag = tag_dist(gen);
+                while (repeat(addrs[set], tag))
+                    tag = tag_dist(gen);
+                
+                u64 addr = ((tag << n_ixbits) | set) << n_offbits;
+                addrs[set][i] = addr;
+                auto [res, _r1, _r2] = L1d.insert(
+                    reinterpret_cast<void *>(addr), Modified
+                );
+                TS_ASSERT(res == NoEvict);
+            }
+        }
+        for (auto set = 0u; set < num_sets; set++) {
+            for (auto iter = 0u; iter < 100u; iter++) {
+                u64 tag = tag_dist(gen);
+                while (repeat(addrs[set], tag))
+                    tag = tag_dist(gen);
+
+                u64 addr = ((tag << n_ixbits) | set) << n_offbits;
+                auto [res, _r1, loc] = L1d.insert(
+                    reinterpret_cast<void *>(addr), Modified
+                );
+                TS_ASSERT(loc / l1d_assoc == set);
+                addrs[set][loc % l1d_assoc] = addr;
+                TS_ASSERT(res == WriteBack);
+            }
         }
     }
 };
