@@ -1497,10 +1497,11 @@ extern "C" void __cachesim_load_data(void *addr)
     cachesim::system::instance().enqueue(addr, cpuid, false, true);
 }
 
-extern "C" void __cachesim_load_instr(void *addr)
+extern "C" void __cachesim_load_instr(u64 pc)
 {
     int cpuid = sched_getcpu();
-    cachesim::system::instance().enqueue(addr, cpuid, false, false);
+    cachesim::system::instance().enqueue(reinterpret_cast<void *>(pc),
+                                         cpuid, false, false);
 }
 
 __attribute__((constructor(101))) static void setup()

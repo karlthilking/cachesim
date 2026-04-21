@@ -3,13 +3,28 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
 namespace {
 class CacheSimPass : public PassInfoMixin<CacheSimPass> {
+private:
+    void setFunctionAttrs(Function *F)
+    {
+        F->setDoesNotThrow();
+        F->addFnAttr(Attribute::NoFree);
+        F->addFnAttr(Attribute::WillReturn);
+        F->addFnAttr(Attribute::NoSync);
+        F->addFnAttr(Attribute::NoRecurse);
+        F->setMemoryEffects(MemoryEffects::inaccessibleMemOnly());
+    }
 public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &_)
     {
+        static int store_data_sites = 0;
+        static int load_data_sites = 0;
+        static int load_instr_sites = 0;
+
         for (Function &F : M) {
             LLVMContext &C = F.getContext();
 
@@ -21,34 +36,61 @@ public:
                     false
                 )
             );
+            setFunctionAttrs(dyn_cast<Function>(storeDataHook.getCallee()));
                 
             FunctionCallee loadDataHook = M.getOrInsertFunction(
                 "__cachesim_load_data",
                 FunctionType::get(
                     Type::getVoidTy(C),
-                    {PointerType::getUnqual(C)},
+                    {Type::getVoidTy(C)},
                     false
                 )
             );
-            
+            setFunctionAttrs(dyn_cast<Function>(loadDataHook.getCallee()));
+
+            // FunctionCallee loadInstrHook = M.getOrInsertFunction(
+            //     "__cachesim_load_instr",
+            //     FunctionType::get(
+            //         Type::getVoidTy(C),
+            //         {Type::getInt64Ty(C)},
+            //         false
+            //     )
+            // );
+            // setFunctionAttrs(dyn_cast<Function>(loadInstrHook.getCallee()));
+
             for (BasicBlock &BB: F) {
                 for (Instruction &I : BB) {
                     IRBuilder<> Builder(&I);
+                    // InlineAsm *getPC = InlineAsm::get(
+                    //     FunctionType::get(Builder.getInt64Ty(), false),
+                    //     "adr %0, .",
+                    //     "=r",
+                    //     false
+                    // );
+                    // Value *pc = Builder.CreateCall(getPC);
+                    // Builder.CreateCall(loadInstrHook, {pc});
+                    // load_instr_sites++;
                     if (auto *LI = dyn_cast<LoadInst>(&I)) {
                         Builder.CreateCall(
                             loadDataHook, 
                             LI->getPointerOperand()
                         );
+                        load_data_sites++;
                     } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
                         Builder.CreateCall(
                             storeDataHook,
                             SI->getPointerOperand()
                         );
+                        store_data_sites++;
                     }
                 }
             }
         }
-
+        
+        errs() << "Total Injected Function Call Sites:\n"
+               << "__cachesim_store_data: " << store_data_sites << '\n'
+               << "__cachesim_load_data:  " << load_data_sites << '\n'
+               << "__cachesim_load_instr: " << load_instr_sites << '\n';
         return PreservedAnalyses::none();
     }
 

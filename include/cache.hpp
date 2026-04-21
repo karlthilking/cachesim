@@ -314,7 +314,7 @@ extern "C" {
 
 void __cachesim_store_data(void *addr);
 void __cachesim_load_data(void *addr);
-void __cachesim_load_instr(void *addr);
+void __cachesim_load_instr(u64 pc);
 
 #ifdef __cplusplus
 }
