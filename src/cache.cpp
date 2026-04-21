@@ -1349,7 +1349,7 @@ system::~system() noexcept
         L2_totals[5] += proc.L2.stats.write_backs;
     }
 
-    u64 instructions    = L1i_totals[0] + L1i_totals[1];
+    // u64 instructions    = L1i_totals[0] + L1i_totals[1];
     u64 loads           = L1i_totals[0] + L1i_totals[1] + 
                           L1d_totals[2] + L1d_totals[3];
     u64 stores          = L1d_totals[0] + L1d_totals[1];
@@ -1357,73 +1357,76 @@ system::~system() noexcept
                           L2_totals[4] + L3.stats.evictions;
     u64 write_backs     = L1d_totals[5] + L2_totals[5] + 
                           L3.stats.write_backs;
+    u64 accesses        = loads + stores;
     
-    f64 pct_l1i_hits = static_cast<f64>(L1i_totals[0]) /
-                       static_cast<f64>(L1i_totals[0] +
-                                        L1i_totals[1]);
+    f64 pct_loads       = (static_cast<f64>(loads) / 
+                           static_cast<f64>(accesses)) * 100.0f;
+    f64 pct_stores      = (static_cast<f64>(stores) / 
+                           static_cast<f64>(accesses)) * 100.0f;
+    
+    f64 pct_l1d_hits    = (static_cast<f64>(L1d_totals[0] + 
+                                            L1d_totals[2]) /
+                           static_cast<f64>(L1d_totals[0] + 
+                                            L1d_totals[1] +
+                                            L1d_totals[2] + 
+                                            L1d_totals[3])) * 100.0f;
 
-    f64 pct_l1d_hits = static_cast<f64>(L1d_totals[0] +
-                                        L1d_totals[2]) /
-                       static_cast<f64>(L1d_totals[0] +
-                                        L1d_totals[1] +
-                                        L1d_totals[2] +
-                                        L1d_totals[3]);
+    f64 pct_l2_hits     = (static_cast<f64>(L2_totals[0] +
+                                            L2_totals[2]) /
+                           static_cast<f64>(L2_totals[0] +
+                                            L2_totals[1] +
+                                            L2_totals[2] +
+                                            L2_totals[3])) * 100.0f;
 
-    f64 pct_l2_hits = static_cast<f64>(L2_totals[0] + 
-                                       L2_totals[2]) /
-                      static_cast<f64>(L2_totals[0] + 
-                                       L2_totals[1] +
-                                       L2_totals[2] + 
-                                       L2_totals[3]); 
+    u64 L3_accesses     = L3.stats.rd_hits + L3.stats.rd_misses +
+                          L3.stats.wr_hits + L3.stats.wr_misses;
+    u64 L3_misses       = L3.stats.rd_misses + L3.stats.wr_misses;
 
-    f64 pct_l3_hits = static_cast<f64>(L3.stats.wr_hits + 
-                                       L3.stats.rd_hits) /
-                      static_cast<f64>(L3.stats.wr_hits + 
-                                       L3.stats.rd_hits +
-                                       L3.stats.wr_misses + 
-                                       L3.stats.rd_misses);
 
-    std::cout << "[CACHE SUMMARY]\n\n"
-              << "INSTRUCTIONS:     " << instructions           << '\n'
-              << "MEMORY ACCESSES:  " << loads + stores         << '\n'
-              << "LOADS:            " << loads                  << '\n'
-              << "STORES:           " << stores                 << '\n'
-              << "EVICTIONS:        " << evictions              << '\n'
-              << "WRITE BACKS:      " << write_backs            << '\n'
-              << "BUS TRANSACTIONS: " << bus_transactions       << '\n'
+    std::cout << "+---------------+" << '\n'
+              << "| Cache Summary |" << '\n'
+              << "+---------------+" << '\n'
+              << "Memory Accesses:      " << accesses << '\n'
+              << "  Loads:              " << loads 
+              << " (" << pct_loads << "%)" << '\n'
+              << "  Stores:             " << stores 
+              << " (" << pct_stores << "%)" << '\n'
+              << "  Evictions:          " << evictions << '\n'
+              << "  Writebacks:         " << write_backs << '\n'
               << '\n'
-              << "L1 Data Summary:\n"
-              << "L1d WRITE HITS:   " << L1d_totals[0]          << '\n'
-              << "L1d WRITE MISSES: " << L1d_totals[1]          << '\n'
-              << "L1d READ HITS:    " << L1d_totals[2]          << '\n'
-              << "L1d READ MISSES:  " << L1d_totals[3]          << '\n'
-              << "PERCENT L1d HITS: " << pct_l1d_hits           << '\n'
-              << "L1d EVICTIONS:    " << L1d_totals[4]          << '\n'
-              << "L1d WRITE BACKS:  " << L1d_totals[5]          << '\n'
+              << "+-------------+" << '\n'
+              << "| L1d Summary |" << '\n'
+              << "+-------------+" << '\n'
+              << "  Hit Rate:           " << pct_l1d_hits << "%\n"
+              << "  Write Hits:         " << L1d_totals[0] << '\n'
+              << "  Write Misses:       " << L1d_totals[1] << '\n'
+              << "  Read Hits:          " << L1d_totals[2] << '\n'
+              << "  Read Misses:        " << L1d_totals[3] << '\n'
+              << "  Evictions:          " << L1d_totals[4] << '\n'
+              << "  Writebacks:         " << L1d_totals[5] << '\n'
               << '\n'
-              << "L1 Instruction Summary:\n"
-              << "L1i READ HITS:    " << L1i_totals[0]          << '\n'
-              << "L1i READ MISSES:  " << L1i_totals[1]          << '\n'
-              << "PERCENT L1i HITS: " << pct_l1i_hits           << '\n'
-              << "L1i EVICTIONS:    " << L1i_totals[2]          << '\n'
+              << "+------------+" << '\n'
+              << "| L2 Summary |" << '\n'
+              << "+------------+" << '\n'
+              << "  Accesses:           " << L2_totals[0] + L2_totals[1] + 
+                                             L2_totals[2] + L2_totals[3] << '\n'
+              << "  Hit Rate:           " << pct_l2_hits << "%\n"
+              << "  Read Hits/Misses:   " << L2_totals[2] << " / " 
+                                          << L2_totals[3] << '\n'
+              << "  Write Hits/Misses:  " << L2_totals[0] << " / "
+                                          << L2_totals[1] << '\n'
+              << "  Writebacks:         " << L2_totals[5] << '\n'
               << '\n'
-              << "L2 Summary:\n"
-              << "L2 WRITE HITS:    " << L2_totals[0]           << '\n'
-              << "L2 WRITE MISSES:  " << L2_totals[1]           << '\n'
-              << "L2 READ HITS:     " << L2_totals[2]           << '\n'
-              << "L2 READ MISSES:   " << L2_totals[3]           << '\n'
-              << "PERCENT L2 HITS:  " << pct_l2_hits            << '\n'
-              << "L2 EVICTIONS:     " << L2_totals[4]           << '\n'
-              << "L2 WRITE BACKS:   " << L2_totals[5]           << '\n'
+              << "+------------+" << '\n'
+              << "| L3 Summary |" << '\n'
+              << "+------------+" << '\n'
+              << "  Accesses:           " << L3_accesses << '\n'
+              << "  Misses to RAM:      " << L3_misses << '\n'
               << '\n'
-              << "L3 Summary:\n"
-              << "L3 WRITE HITS:    " << L3.stats.wr_hits       << '\n'
-              << "L3 WRITE MISSES:  " << L3.stats.wr_misses     << '\n'
-              << "L3 READ HITS:     " << L3.stats.rd_hits       << '\n'
-              << "L3 READ MISSES:   " << L3.stats.rd_misses     << '\n'
-              << "PERCENT L3 HITS:  " << pct_l3_hits            << '\n'
-              << "L3 EVICTIONS:     " << L3.stats.evictions     << '\n'
-              << "L3 WRITE BACKS:   " << L3.stats.write_backs   << '\n';
+              << "+-------------------+" << '\n'
+              << "| Coherence Summary |" << '\n'
+              << "+-------------------+" << '\n'
+              << "  Bus Transactions:   " << bus_transactions << '\n';
 }
 
 /**
