@@ -13,8 +13,7 @@ CXXTEST=$(TEST)/cxxtest
 all: $(PROGRAMS)
 
 lib%.so: $(SOURCE)/%.cpp
-	clang++ -I$(INCLUDE) $(CXXFLAGS) -fPIC -c $< -o %.o
-	clang++ $(LDFLAGS) -shared -fPIC -o $@ %.o
+	clang++ -I$(INCLUDE) $(CXXFLAGS) -shared -fPIC -o $@ $<
 
 cachetest: cachetest.o cache.o cache.cxxtest.o
 	clang++ $(LDFLAGS) $^ -o $@

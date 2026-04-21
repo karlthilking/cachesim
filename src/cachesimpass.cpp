@@ -7,65 +7,63 @@ using namespace llvm;
 
 namespace {
 class CacheSimPass : public PassInfoMixin<CacheSimPass> {
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM)
+public:
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &_)
     {
-        Module *M = F.getParent();
-        DataLayout &DL = M->getDataLayout();
-        LLVMContext &C = M->getContext();
-        
-        FunctionCallee storeDataHook = M->getOrInsertFunction(
-            "__cachesim_store_data", 
-            FunctionType::get(
-                Type::getVoidTy(C),
-                {PointerType::getUnqual(C)},
-                false
-            )
-        );
+        for (Function &F : M) {
+            LLVMContext &C = F.getContext();
 
-        FunctionCallee loadDataHook = M->getOrInsertFunction(
-            "__cachesim_load_data",
-            FunctionType::get(
-                Type::getVoidTy(C), 
-                {PointerType::getUnqual(C)}, 
-                false
-            )
-        );
-
-        FunctionCallee loadInstrHook = M->getOrInsertFunction(
-            "__cachesim_load_instr",
-            FunctionType::get(
-                Type::getVoidTy(c), 
-                {PointerType::getUnqual(C)}, 
-                false
-            )
-        );
-    
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                IRBuilder<> Builder(&I);
-                if (auto *LI = dyn_cast<LoadInst>(&I)) {
-                    IRBuilder<> Builder(LI);
-                    Value *op = LI->getPointerOperand();
-                    Builder.CreateCall(loadDataHook, {op});
-                } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-                    IRBuilder<> Builder(SI);
-                    Value *op = SI->getPointerOperand();
-                    Builder.CreateCall(storeDataHook, {op});
+            FunctionCallee storeDataHook = M.getOrInsertFunction(
+                "__cachesim_store_data",
+                FunctionType::get(
+                    Type::getVoidTy(C),
+                    {PointerType::getUnqual(C)},
+                    false
+                )
+            );
+                
+            FunctionCallee loadDataHook = M.getOrInsertFunction(
+                "__cachesim_load_data",
+                FunctionType::get(
+                    Type::getVoidTy(C),
+                    {PointerType::getUnqual(C)},
+                    false
+                )
+            );
+            
+            for (BasicBlock &BB: F) {
+                for (Instruction &I : BB) {
+                    IRBuilder<> Builder(&I);
+                    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+                        Builder.CreateCall(
+                            loadDataHook, 
+                            LI->getPointerOperand()
+                        );
+                    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                        Builder.CreateCall(
+                            storeDataHook,
+                            SI->getPointerOperand()
+                        );
+                    }
                 }
             }
         }
-    
+
         return PreservedAnalyses::none();
     }
+
+    static bool isRequired() { return true; }
 };
 } // anonymous namespace
 
 PassPluginLibraryInfo getCacheSimPluginInfo()
 {
-    auto registerCacheSimCallback = [](PassBuilder &PB) {
+    const auto registerCacheSimCallback = [](PassBuilder &PB) {
         PB.registerOptimizerLastEPCallback(
-            [](FunctionPassManger &PM, OptimizationLevel Level) {
-                PB.addPass(CacheSimPass());
+            [](ModulePassManager &PM, 
+               [[maybe_unused]] OptimizationLevel Level,
+               [[maybe_unused]] ThinOrFullLTOPhase Phase) {
+                PM.addPass(CacheSimPass());
             });
     };
 
@@ -73,7 +71,7 @@ PassPluginLibraryInfo getCacheSimPluginInfo()
             LLVM_VERSION_STRING, registerCacheSimCallback};
 }
 
-extern "C" LLVM_ATTIBUTE_WEAK ::llvm::PassPluginLibraryInfo 
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo 
 llvmGetPassPluginInfo()
 {
     return getCacheSimPluginInfo();
