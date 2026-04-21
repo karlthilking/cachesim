@@ -79,16 +79,6 @@ enum cache_type : u8 {
     SharedCache
 };
 
-// using task_descriptor = u8;
-// #define NullTask    0x00
-// #define LoadTask    0x01
-// #define StoreTask   0x02
-// #define DataTask    0x04
-// #define InstrTask   0x08
-// #define DflTask     0x10
-// #define SnoopTask   0x20
-// #define StopTask    0x40
-
 struct cache_profile {
     u32 wr_hits;
     u32 rd_hits;
@@ -162,11 +152,8 @@ public:
     std::tuple<bool, cache_state, ptrdiff_t>
     find(void *addr) const noexcept;
 
-    std::tuple<bool, cache_state, ptrdiff_t> 
-    load(void *addr, u32 id) noexcept;
-    
-    std::tuple<bool, cache_state, ptrdiff_t> 
-    store(void *addr, u32 id) noexcept;
+    std::tuple<bool, cache_state, ptrdiff_t> load(void *addr) noexcept;
+    std::tuple<bool, cache_state, ptrdiff_t> store(void *addr) noexcept;
     
     ptrdiff_t elect(void *addr) noexcept;
     
@@ -180,61 +167,8 @@ public:
     void update(void *addr, cache_state state, bool use) noexcept;
 };
 
-// struct task {
-//     std::promise<response>  promise;
-//     void                    *addr;
-//     task_descriptor         td;
-//     request                 brq;
-//     
-//     task() noexcept = default;
-// 
-//     task(void *addr_, task_descriptor td_, request brq) noexcept
-//         : addr(addr), td(td), brq(brq)
-//     {}
-// 
-//     task(void *addr, task_descriptor td, 
-//          request brq, std::promise<response> prom) noexcept
-//          : promise(std::move(prom)), addr(addr), td(td), brq(brq)
-//     {}
-//     
-//     task(const task &_t) = delete;
-//     task &operator=(const task &_t) = delete;
-// 
-//     task(task &&t) noexcept
-//         : promise(std::move(t.promise))
-//         , addr(std::exchange(t.addr, nullptr))
-//         , td(std::exchange(t.td, NullTask))
-//         , brq(t.brq)
-//     {}
-// 
-//     task &operator=(task &&t) noexcept
-//     {
-//         if (this != &t) {
-//             promise = std::move(t.promise);
-//             addr = std::exchange(t.addr, nullptr);
-//             td = std::exchange(t.td, NullTask);
-//             brq = t.brq;
-//         }
-//         return *this;
-//     }
-// };
-
-// struct taskcmp {
-//     auto operator()(const task &a, const task &b) -> bool
-//     {
-//         return !(a.td & SnoopTask) && (b.td & SnoopTask);
-//     }
-// };
-
 class cpu {
-public:
-    // using task_queue = std::priority_queue<task, std::vector<task>, taskcmp>;
-    // using counting_sem = std::counting_semaphore<max_sem_count>;
 private:
-    // task_queue      tasks;
-    // std::mutex      mtx;
-    // std::thread     worker;
-    // counting_sem    sem;
     cache           L1d;
     cache           L1i;
     cache           L2;
@@ -244,7 +178,6 @@ private:
 public:
     cpu() noexcept;
     cpu(u32 id) noexcept;
-    // void start(u32 cpuid) noexcept;
     
     cpu(const cpu &_) = delete;
     cpu &operator=(const cpu &_) = delete;
@@ -268,38 +201,6 @@ public:
     void load_data(void *addr) noexcept;
     void store_data(void *addr) noexcept;
     void load_instr(void *addr) noexcept;
-    
-    /**
-     * enqueue_task():
-     *  Notify cpu of available work (loads, stores)
-     */
-    // template<typename... Args>
-    // void enqueue_task(Args &&...args) noexcept
-    // requires std::is_constructible_v<task, Args...>
-    // {
-    //     std::scoped_lock lock(mtx);
-    //     tasks.emplace(std::forward<Args>(args)...);
-    //     sem.release();
-    // }
-    
-    /**
-     * enqueue_busrq():
-     *  Notify cpu to snoop a bus request sent over the memory bus by
-     *  adding a snoop request message onto its work queue
-     */
-    // template<typename... Args>
-    // std::future<response> enqueue_busrq(Args &&...args) noexcept
-    // requires std::is_constructible_v<task, Args..., std::promise<response>>
-    // {
-    //     std::promise<response> promise;
-    //     auto future = promise.get_future();
-    //     {
-    //         std::scoped_lock lock(mtx);
-    //         tasks.emplace(std::forward<Args>(args)..., std::move(promise));
-    //     }
-    //     sem.release();
-    //     return future;
-    // }
 };
 
 struct dirent {

@@ -77,7 +77,7 @@ public:
                           l1d_size / l1d_blk_size);
             }
             {
-                auto [found, state, loc] = L1d.load(ptr + i, 0u);
+                auto [found, state, loc] = L1d.load(ptr + i);
                 TS_ASSERT(found && state == Modified);
                 TS_ASSERT(loc >= 0);
                 TS_ASSERT(static_cast<u64>(loc) <
