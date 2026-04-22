@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <iomanip>
 #include <sched.h>
 #include <unistd.h>
 #include "../include/params.hpp"
@@ -1277,54 +1278,14 @@ directory::directory(size_t size, size_t block_size) noexcept
 system::system() noexcept
     : L3(l3_size, l3_blk_size, l3_assoc, SharedCache)
     , dir(l3_size, l3_blk_size)
-    , sem(0u)
     , bus_transactions(0u)
 {
     for (auto i = 0u; i < ncpus; i++)
         cpus[i] = cpu(i);
-
-    worker = std::thread([this] {
-        bool stop = false;
-        for (;;) {
-            task t;
-            sem.acquire();
-            {
-                std::scoped_lock lock(mtx);
-                t = std::move(tasks.front());
-                tasks.pop();
-            }
-            if (stop && tasks.empty())
-                return;
-            else if (t.task_type == TASK_STOP) {
-                stop = true;
-                if (tasks.empty())
-                    return;
-                continue;
-            } else {
-                cpu &proc = cpus[t.cpuid];
-                switch (t.task_type) {
-                case STORE_DATA:
-                    proc.store_data(t.addr);
-                    continue;
-                case LOAD_DATA:
-                    proc.load_data(t.addr);
-                    continue;
-                case LOAD_INSTR:
-                    proc.load_instr(t.addr);
-                    continue;
-                default:
-                    assert(0);
-                }
-            }
-        }
-    });
 }
 
 system::~system() noexcept
 {
-    enqueue(TASK_STOP);
-    worker.join();
-
     u64 L1i_totals[3]{};
     u64 L1d_totals[6]{};
     u64 L2_totals[6]{};
@@ -1349,7 +1310,7 @@ system::~system() noexcept
         L2_totals[5] += proc.L2.stats.write_backs;
     }
 
-    // u64 instructions    = L1i_totals[0] + L1i_totals[1];
+    u64 instructions    = L1i_totals[0] + L1i_totals[1];
     u64 loads           = L1i_totals[0] + L1i_totals[1] + 
                           L1d_totals[2] + L1d_totals[3];
     u64 stores          = L1d_totals[0] + L1d_totals[1];
@@ -1363,6 +1324,10 @@ system::~system() noexcept
                            static_cast<f64>(accesses)) * 100.0f;
     f64 pct_stores      = (static_cast<f64>(stores) / 
                            static_cast<f64>(accesses)) * 100.0f;
+
+    f64 pct_l1i_hits    = static_cast<f64>(L1i_totals[0]) /
+                          static_cast<f64>(L1i_totals[0] +
+                                           L1i_totals[1]) * 100.0f;
     
     f64 pct_l1d_hits    = (static_cast<f64>(L1d_totals[0] + 
                                             L1d_totals[2]) /
@@ -1383,10 +1348,12 @@ system::~system() noexcept
     u64 L3_misses       = L3.stats.rd_misses + L3.stats.wr_misses;
 
 
-    std::cout << "+---------------+" << '\n'
-              << "| Cache Summary |" << '\n'
+    std::cout << std::setprecision(4)
               << "+---------------+" << '\n'
-              << "Memory Accesses:      " << accesses << '\n'
+              << "| CACHE SUMMARY |" << '\n'
+              << "+---------------+" << '\n'
+              << "  Instructions:       " << instructions << '\n'
+              << "  Memory Accesses:    " << accesses << '\n'
               << "  Loads:              " << loads 
               << " (" << pct_loads << "%)" << '\n'
               << "  Stores:             " << stores 
@@ -1394,9 +1361,7 @@ system::~system() noexcept
               << "  Evictions:          " << evictions << '\n'
               << "  Writebacks:         " << write_backs << '\n'
               << '\n'
-              << "+-------------+" << '\n'
-              << "| L1d Summary |" << '\n'
-              << "+-------------+" << '\n'
+              << "L1d Summary:\n"
               << "  Hit Rate:           " << pct_l1d_hits << "%\n"
               << "  Write Hits:         " << L1d_totals[0] << '\n'
               << "  Write Misses:       " << L1d_totals[1] << '\n'
@@ -1405,9 +1370,13 @@ system::~system() noexcept
               << "  Evictions:          " << L1d_totals[4] << '\n'
               << "  Writebacks:         " << L1d_totals[5] << '\n'
               << '\n'
-              << "+------------+" << '\n'
-              << "| L2 Summary |" << '\n'
-              << "+------------+" << '\n'
+              << "L1i Summary:\n"
+              << "  Hit Rate:           " << pct_l1i_hits << "%\n"
+              << "  Hits:               " << L1i_totals[0] << '\n'
+              << "  Misses:             " << L1i_totals[1] << '\n'
+              << "  Evictions:          " << L1i_totals[2] << '\n'
+              << '\n'
+              << "L2 Summary:\n"
               << "  Accesses:           " << L2_totals[0] + L2_totals[1] + 
                                              L2_totals[2] + L2_totals[3] << '\n'
               << "  Hit Rate:           " << pct_l2_hits << "%\n"
@@ -1415,17 +1384,14 @@ system::~system() noexcept
                                           << L2_totals[3] << '\n'
               << "  Write Hits/Misses:  " << L2_totals[0] << " / "
                                           << L2_totals[1] << '\n'
+              << "  Evictions:          " << L2_totals[4] << '\n'
               << "  Writebacks:         " << L2_totals[5] << '\n'
               << '\n'
-              << "+------------+" << '\n'
-              << "| L3 Summary |" << '\n'
-              << "+------------+" << '\n'
+              << "L3 Summary:\n"
               << "  Accesses:           " << L3_accesses << '\n'
               << "  Misses to RAM:      " << L3_misses << '\n'
               << '\n'
-              << "+-------------------+" << '\n'
-              << "| Coherence Summary |" << '\n'
-              << "+-------------------+" << '\n'
+              << "Coherence Summary" << '\n'
               << "  Bus Transactions:   " << bus_transactions << '\n';
 }
 
@@ -1491,20 +1457,30 @@ void system::initiate_transaction() noexcept
 extern "C" void __cachesim_store_data(void *addr)
 {
     int cpuid = sched_getcpu();
-    cachesim::system::instance().enqueue(addr, cpuid, true, true);
+    cachesim::system::instance().acquire();
+    cachesim::system::instance().access_cpu(cpuid).store_data(addr);
+    cachesim::system::instance().release();
 }
 
 extern "C" void __cachesim_load_data(void *addr)
 {
     int cpuid = sched_getcpu();
-    cachesim::system::instance().enqueue(addr, cpuid, false, true);
+    cachesim::system::instance().acquire();
+    cachesim::system::instance().access_cpu(cpuid).load_data(addr);
+    cachesim::system::instance().release();
 }
 
-extern "C" void __cachesim_load_instr(u64 pc)
+extern "C" void __cachesim_load_instr(u64 start, u64 end)
 {
     int cpuid = sched_getcpu();
-    cachesim::system::instance().enqueue(reinterpret_cast<void *>(pc),
-                                         cpuid, false, false);
+    
+    for (u64 addr = start; addr <= end + 4; addr += 4) {
+        cachesim::system::instance().acquire();
+        cachesim::system::instance().access_cpu(cpuid).load_instr(
+            reinterpret_cast<void *>(addr)
+        );
+        cachesim::system::instance().release();
+    }
 }
 
 __attribute__((constructor(101))) static void setup()

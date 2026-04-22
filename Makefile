@@ -43,7 +43,7 @@ build: all
 	@(rm -f *.o cachetest.cpp *.cxxtest.cpp)
 
 clean:
-	rm -f $(PROGRAMS) *cxxtest.cpp cachetest.cpp *.o *.so *.ll
+	rm -f $(PROGRAMS) callgrind* *cxxtest.cpp cachetest.cpp *.o *.so *.ll *.out
 
 
 

@@ -14,8 +14,8 @@ private:
         F->setDoesNotThrow();
         F->addFnAttr(Attribute::NoFree);
         F->addFnAttr(Attribute::WillReturn);
-        F->addFnAttr(Attribute::NoSync);
         F->addFnAttr(Attribute::NoRecurse);
+        F->addFnAttr(Attribute::NoUnwind);
         F->setMemoryEffects(MemoryEffects::inaccessibleMemOnly());
     }
 public:
@@ -38,44 +38,89 @@ public:
                 "__cachesim_load_data",
                 FunctionType::get(
                     Type::getVoidTy(C),
-                    {Type::getVoidTy(C)},
+                    {PointerType::getUnqual(C)},
                     false
                 )
             );
             setFunctionAttrs(dyn_cast<Function>(loadDataHook.getCallee()));
 
-            // FunctionCallee loadInstrHook = M.getOrInsertFunction(
-            //     "__cachesim_load_instr",
-            //     FunctionType::get(
-            //         Type::getVoidTy(C),
-            //         {Type::getInt64Ty(C)},
-            //         false
-            //     )
-            // );
-            // setFunctionAttrs(dyn_cast<Function>(loadInstrHook.getCallee()));
+            FunctionCallee loadInstHook = M.getOrInsertFunction(
+                "__cachesim_load_instr",
+                FunctionType::get(
+                    Type::getVoidTy(C),
+                    {PointerType::getInt64Ty(C), 
+                     PointerType::getInt64Ty(C)},
+                    false
+                )
+            );
+            setFunctionAttrs(dyn_cast<Function>(loadInstHook.getCallee()));
+#if defined(__aarch64__)
+            InlineAsm *getPC = InlineAsm::get(
+                FunctionType::get(
+                    Type::getInt64Ty(C), 
+                    {Type::getVoidTy(C)}, 
+                    false
+                ),
+                "adr $0, .", "=r", false
+            );
+#elif defined(__x86_64)
+            InlineAsm *getPC = InlineAsm::get(
+                FunctionType::get(
+                    Type::getInt64Ty(C),
+                    {Type::getVoidTy(C)},
+                    false,
+                    false,
+                    AD_ATT
+                ),
+                "lea 0(%rip), $0", "=r", false
+            );
+#endif
 
             for (BasicBlock &BB: F) {
+                SmallVector<LoadInst *, 16> loads;
+                SmallVector<StoreInst *, 16> stores;
+                SmallVector<AtomicRMWInst *, 16> atomics;
+                SmallVector<AtomicCmpXchgInst *, 16> xchgs;
+
                 for (Instruction &I : BB) {
-                    IRBuilder<> Builder(&I);
-                    // InlineAsm *getPC = InlineAsm::get(
-                    //     FunctionType::get(Builder.getInt64Ty(), false),
-                    //     "adr %0, .",
-                    //     "=r",
-                    //     false
-                    // );
-                    // Value *pc = Builder.CreateCall(getPC);
-                    // Builder.CreateCall(loadInstrHook, {pc});
-                    if (auto *LI = dyn_cast<LoadInst>(&I)) {
-                        Builder.CreateCall(
-                            loadDataHook, 
-                            LI->getPointerOperand()
-                        );
-                    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-                        Builder.CreateCall(
-                            storeDataHook,
-                            SI->getPointerOperand()
-                        );
-                    }
+                    if (I.isDebugOrPseudoInst())
+                        continue;
+                    else if (LoadInst *LI = dyn_cast<LoadInst>(&I))
+                        loads.push_back(LI);
+                    else if (StoreInst *SI = dyn_cast<StoreInst>(&I))
+                        stores.push_back(SI);
+                    else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(&I))
+                        atomics.push_back(RMW);
+                    else if (AtomicCmpXchgInst *xchg = 
+                             dyn_cast<AtomicCmpXchgInst>(&I))
+                        xchgs.push_back(xchg);
+                }
+                
+                Instruction &start = *BB.getFirstInsertionPt();
+                Instruction &end = *BB.getTerminator();
+
+                IRBuilder StartBuilder(&start);
+                Value *startPC = StartBuilder.CreateCall(getPC);
+
+                IRBuilder EndBuilder(&end);
+                Value *endPC = EndBuilder.CreateCall(getPC);
+                EndBuilder.CreateCall(loadInstHook, {startPC, endPC});
+
+                for (LoadInst *LI : loads) {
+                    IRBuilder<> B(LI);
+                    B.CreateCall(loadDataHook, LI->getPointerOperand());
+                }
+                for (StoreInst *SI : stores) {
+                    IRBuilder<> B(SI);
+                    B.CreateCall(storeDataHook, SI->getPointerOperand());
+                }
+                for (AtomicRMWInst *RMW : atomics) {
+                    IRBuilder<> B(RMW);
+                    B.CreateCall(storeDataHook, RMW->getPointerOperand());
+                }
+                for (AtomicCmpXchgInst *CmpXchg : xchgs) {
+                    IRBuilder<> B(CmpXchg);
+                    B.CreateCall(storeDataHook, CmpXchg->getPointerOperand());
                 }
             }
         }

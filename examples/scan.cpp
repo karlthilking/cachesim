@@ -39,7 +39,7 @@ int main(void)
         c->__c = '\0';
     delete[] chars;
     
-    for (auto iter = 0u; iter < 256u; iter++) {
+    for (auto iter = 0u; iter < 1024u; iter++) {
         node *head = new node;
         node *n = nullptr;
         int i;

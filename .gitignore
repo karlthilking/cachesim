@@ -1,0 +1,5 @@
+cxxtest/
+test/cxxtest
+*.o
+*.so
+*.out
