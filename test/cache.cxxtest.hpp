@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <random>
+#include <algorithm>
 #include <cxxtest/TestSuite.h>
 #include "../include/cache.hpp"
 

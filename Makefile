@@ -1,13 +1,14 @@
-CXXFLAGS=-std=c++23 -g -O3 -Wall -Wextra -Werror
+CXXFLAGS=-std=c++20 -g -O3 -Wall -Wextra -Werror
+LDFLAGS=-std=c++20
 CXXTESTFLAGS=-Wno-ignored-qualifiers -Wno-deprecated-enum-float-conversion
-LDFLAGS=-std=c++23
 LLVMFLAGS=-fpass-plugin=./libcachesimpass.so
-PROGRAMS=libcache.so cachetest matmul scan
+PROGRAMS=libcache.so libcachesimpass.so cachesim_launch cachetest
 MAKEFLAGS += --no-print-directory
 
 SOURCE=./src
 INCLUDE=./include
 TEST=./test
+EXAMPLES=./examples
 CXXTEST=$(TEST)/cxxtest
 
 all: $(PROGRAMS)
@@ -31,8 +32,8 @@ cache.cxxtest.o: cache.cxxtest.cpp
 	python3 -W ignore $(CXXTEST)/bin/cxxtestgen --part --error-printer \
 			$< -o $@
 
-%: ./programs/%.cpp libcache.so libcachesimpass.so
-	clang++ $(CXXFLAGS) -L. -lcache -Wl,-rpath,. $(LLVMFLAGS) -o $@ $<
+cachesim_launch: $(SOURCE)/cachesim_launch.cpp
+	clang++ $(CXXFLAGS) -o $@ $<
 
 cachetest.cpp:
 	python3 -W ignore $(CXXTEST)/bin/cxxtestgen --root --error-printer \

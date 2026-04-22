@@ -21,10 +21,6 @@ private:
 public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &_)
     {
-        static int store_data_sites = 0;
-        static int load_data_sites = 0;
-        static int load_instr_sites = 0;
-
         for (Function &F : M) {
             LLVMContext &C = F.getContext();
 
@@ -69,28 +65,21 @@ public:
                     // );
                     // Value *pc = Builder.CreateCall(getPC);
                     // Builder.CreateCall(loadInstrHook, {pc});
-                    // load_instr_sites++;
                     if (auto *LI = dyn_cast<LoadInst>(&I)) {
                         Builder.CreateCall(
                             loadDataHook, 
                             LI->getPointerOperand()
                         );
-                        load_data_sites++;
                     } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
                         Builder.CreateCall(
                             storeDataHook,
                             SI->getPointerOperand()
                         );
-                        store_data_sites++;
                     }
                 }
             }
         }
         
-        errs() << "Total Injected Function Call Sites:\n"
-               << "__cachesim_store_data: " << store_data_sites << '\n'
-               << "__cachesim_load_data:  " << load_data_sites << '\n'
-               << "__cachesim_load_instr: " << load_instr_sites << '\n';
         return PreservedAnalyses::none();
     }
 
