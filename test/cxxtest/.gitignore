@@ -1,9 +1,0 @@
-__pycache__
-*.pyc
-*.bak
-.*
-guide.epub
-guide.pdf
-guide.html
-parsetab.py
-TEST-cxxtest.xml

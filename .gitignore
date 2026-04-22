@@ -1,5 +1,4 @@
-cxxtest/
-test/cxxtest
+*cxxtest/*
 *.o
 *.so
 *.out
