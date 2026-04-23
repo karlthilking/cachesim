@@ -125,13 +125,7 @@ nearestpow2() {
     next=$((next|(next>>8)))
     next=$((next|(netx>>16)))
     next=$((next+1))
-    local prev=$((next>>1))
-
-    if (( $next-$1 <= $prev-$1 )); then
-        echo $next
-    else
-        echo $prev
-    fi
+    echo $next
 }
 
 if ! ispow2 $L1D_SIZE; then

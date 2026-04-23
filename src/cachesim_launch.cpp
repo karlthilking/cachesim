@@ -11,6 +11,26 @@
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 
+template<typename T>
+bool ispow2(T t)
+{
+    return t && !(t & (t - 1));
+}
+
+template<typename T>
+T roundpow2(T t)
+{
+    auto next = t - 1;
+
+    next |= next >> 1;
+    next |= next >> 2;
+    next |= next >> 4;
+    next |= next >> 8;
+    next |= next >> 16;
+    
+    return next + 1;
+}
+
 bool is_param(char *option)
 {
     return !(strncmp(option, "--L1d", 5) || strncmp(option, "--L1i", 5) ||
@@ -22,12 +42,18 @@ void get_params(char *option, size_t &size,
 {
     char *s = strchr(option, '=') + 1;
     size = strtoul(s, nullptr, 10);
+    if (!ispow2(size))
+        size = roundpow2(size);
 
     s = strchr(s, ',') + 1;
     assoc = strtoul(s, nullptr, 10);
+    if (!ispow2(assoc))
+        assoc = roundpow2(assoc);
 
     s = strchr(s, ',') + 1;
     block_size = strtoul(s, nullptr, 10);
+    if (!ispow2(block_size))
+        block_size = roundpow2(block_size);
 }
 
 void setup_params(char **params, size_t n)
@@ -61,25 +87,25 @@ void setup_params(char **params, size_t n)
             get_params(params[i], l3_size, l3_block_size, l3_assoc);
     }
 
-    fprintf(f, "constexpr size_t    l1d_size        = %zu\n"
-               "constexpr size_t    l1d_block_size  = %zu\n" 
-               "constexpr unsigned  l1d_assoc       = %u\n"
-               "constexpr size_t    l1i_size        = %zu\n"
-               "constexpr size_t    l1i_block_size  = %zu\n"
-               "constexpr unsigned  l1i_assoc       = %u\n"
-               "constexpr size_t    l2_size         = %zu\n"
-               "constexpr size_t    l2_block_size   = %zu\n"
-               "constexpr unsigned  l2_assoc        = %u\n"
-               "constexpr size_t    l3_size         = %zu\n"
-               "constexpr size_t    l3_block_size   = %zu\n"
-               "constexpr unsigned  l3_assoc        = %u\n",
+    fprintf(f, "\tconstexpr size_t    l1d_size        = %zu;\n"
+               "\tconstexpr size_t    l1d_blk_size    = %zu;\n" 
+               "\tconstexpr unsigned  l1d_assoc       = %u;\n"
+               "\tconstexpr size_t    l1i_size        = %zu;\n"
+               "\tconstexpr size_t    l1i_blk_size    = %zu;\n"
+               "\tconstexpr unsigned  l1i_assoc       = %u;\n"
+               "\tconstexpr size_t    l2_size         = %zu;\n"
+               "\tconstexpr size_t    l2_blk_size     = %zu;\n"
+               "\tconstexpr unsigned  l2_assoc        = %u;\n"
+               "\tconstexpr size_t    l3_size         = %zu;\n"
+               "\tconstexpr size_t    l3_blk_size     = %zu;\n"
+               "\tconstexpr unsigned  l3_assoc        = %u;\n",
                l1d_size, l1d_block_size, l1d_assoc,
                l1i_size, l1i_block_size, l1i_assoc,
                l2_size, l2_block_size, l2_assoc,
                l3_size, l3_block_size, l3_assoc);
 
     fprintf(f, "} // namespace cachesim\n"
-               "#endif // __CACHE_PARAMS_HPP__");
+               "#endif // __CACHE_PARAMS_HPP__\n");
 
     fclose(f);
 }
@@ -156,11 +182,13 @@ int main(int argc, char *argv[])
     
     unsigned int i;
     for (i = 1u; i < std::make_unsigned_t<int>(argc - 1); i++) {
-        if (is_param(argv[i]))
+        if (is_param(argv[i])) {
             break;
+        }
         args[5 + i - 1] = argv[i];
     }
-
+    
+    setup_params(argv + i, argc - i - 1);
     args[5 + i - 1] = "-o";
     args[5 + i - 1 + 1] = const_cast<const char *>(binary);
     args[5 + i - 1 + 2] = const_cast<const char *>(source);
