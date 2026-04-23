@@ -1,4 +1,4 @@
-CXXFLAGS=-std=c++20 -g -O3 -Wall -Wextra -Werror
+CXXFLAGS=-std=c++20 -g3 -O1 -Wall -Wextra -Werror
 LDFLAGS=-std=c++20
 CXXTESTFLAGS=-Wno-ignored-qualifiers -Wno-deprecated-enum-float-conversion
 LLVMFLAGS=-fpass-plugin=./libcachesimpass.so

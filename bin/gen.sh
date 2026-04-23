@@ -1,21 +1,57 @@
 #!/bin/bash
 
 ORIGIN=$(echo $PWD)
+
+if [[ -z $(find /sys/devices/system -type d -name cpu) ]]; then
+    echo 'Could not find /sys/devices/system/cpu'
+    exit 1
+fi
+
 cd $(echo /sys/devices/system/cpu)
 
 NCPUS=$(echo $(ls | sort | uniq | grep 'cpu[0-9+]' | wc -l))
+if (( NCPUS == 0 )); then
+    echo 'No cpu information found in /sys/devices/system/cpu'
+    exit 1
+fi
 
 for (( i=0; i<NCPUS; i+=1 ));
 do
+    if [[ -z $(find /sys/devices/system/cpu/cpu$i -type d -name cache) ]]; then
+        echo No cpu cache info found in /sys/devices/system/cpu/cpu$i
+        exit 1
+    fi
     cd $(echo /sys/devices/system/cpu/cpu$i/cache)
 
     NCACHES=$(echo $(ls | grep 'index[0-9]' | sort | uniq | wc -l))
     for (( j=0; j<NCACHES; j+=1 ));
     do
+        if [[ -z $(find ./index$j -type f -name 'size') ]]; then
+            echo No cache capacity information found \
+                 \(Missing: $PWD/index$j/size\)
+            exit 1
+        fi
         SIZE=$(cat index$j/size)
+        if [[ -z $(find ./index$j -type f -name 'coherency_line_size') ]]; then
+            echo No cache line size information found \
+                 \(Missing: $PWD/index$j/coherency_line_size\)
+            exit 1
+        fi
         BLOCK_SIZE=$(cat index$j/coherency_line_size)
+        if [[ -z $(find ./index$j -type f -name 'ways_of_associativity') ]]; then
+            echo No cache associativity information found \(Missing: $PWD/index$j/ways_of_associativity\)
+            exit 1
+        fi
         ASSOC=$(cat index$j/ways_of_associativity)
+        if [[ -z $(find ./index$j -type f -name 'level') ]]; then
+            echo No cache level information found \(Missing: $PWD/index$j/level\)
+            exit 1
+        fi
         LEVEL=$(cat index$j/level)
+        if [[ -z $(find ./index$j -type f -name 'type') ]]; then
+            echo No cache type information found \(Missing: $PWD/index$j/'type'\)
+            exit 1
+        fi
         TYPE=$(cat index$j/'type')
 
         if [[ $LEVEL = "1" && $TYPE = "Instruction" ]]; then
