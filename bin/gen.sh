@@ -38,6 +38,38 @@ do
     done
 done
 
+ispow2() {
+    (( $1 > 0 && (($1 & ($1 - 1)) == 0 )))
+}
+
+nearestpow2() {
+    local next=$(($1-1))
+    next=$((next|(next>>1)))
+    next=$((next|(next>>2)))
+    next=$((next|(next>>4)))
+    next=$((next|(next>>8)))
+    next=$((next|(netx>>16)))
+    next=$((next+1))
+    local prev=$((next>>1))
+
+    if (( $next-$1 <= $prev-$1 )); then
+        echo $next
+    else
+        echo $prev
+    fi
+}
+
+PARAMS=($L1D_SIZE, $L1D_BLOCK_SIZE, $L1D_ASSOC,
+        $L1I_SIZE, $L1I_BLOCK_SIZE, $L1I_ASSOC,
+        $L2_SIZE, $L2_BLOCK_SIZE, $L2_ASSOC,
+        $L3_SIZE, $L3_BLOCK_SIZE, $L3_ASSOC)
+
+for param in "${PARAMS[@]}"; do
+    if ! ispow2 $param; then
+        $param=$(nearestpow2 $param)
+    fi
+done
+
 cd $ORIGIN
 if [[ -n $(find . -type d -name 'bin') ]]; then
     cd ./include

@@ -1474,13 +1474,13 @@ extern "C" void __cachesim_load_instr(u64 start, u64 end)
 {
     int cpuid = sched_getcpu();
     
-    for (u64 addr = start; addr <= end + 4; addr += 4) {
-        cachesim::system::instance().acquire();
+    cachesim::system::instance().acquire();
+    for (u64 addr = start; addr <= end; addr += 4) {
         cachesim::system::instance().access_cpu(cpuid).load_instr(
             reinterpret_cast<void *>(addr)
         );
-        cachesim::system::instance().release();
     }
+    cachesim::system::instance().release();
 }
 
 __attribute__((constructor(101))) static void setup()
